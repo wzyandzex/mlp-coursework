@@ -76,6 +76,30 @@ def _non_negative_int(text: str) -> int:
     return value
 
 
+def _hidden_dims(text: str) -> list:
+    """解析 --hidden-dims：逗号分隔的正整数序列，如 '128' 或 '128,64'。
+
+    空串、空项、非整数、零与负宽度一律报 argparse 输入错误，
+    不静默过滤、不取绝对值、不回退默认结构。
+    """
+    dims = []
+    for part in text.split(","):
+        try:
+            value = int(part)
+        except ValueError:
+            raise argparse.ArgumentTypeError(
+                f"expected comma-separated positive integers (e.g. '128' or '128,64'), "
+                f"got invalid width {part!r} in {text!r}"
+            ) from None
+        if value <= 0:
+            raise argparse.ArgumentTypeError(
+                f"hidden layer widths must be positive integers, "
+                f"got {value!r} in {text!r}"
+            )
+        dims.append(value)
+    return dims
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="src.train_mnist",
@@ -135,6 +159,15 @@ def build_parser() -> argparse.ArgumentParser:
         type=_positive_int,
         default=VAL_SIZE,
         help="Number of validation samples drawn from the official 60000 (default: 5000).",
+    )
+    parser.add_argument(
+        "--hidden-dims",
+        type=_hidden_dims,
+        default=None,
+        metavar="DIMS",
+        help="Comma-separated hidden layer widths, one positive integer per layer, "
+        "e.g. '128' or '128,64' (builds 784 -> 128 -> 64 -> 10). "
+        "Default: 128, i.e. the baseline 784-[128]-10.",
     )
     parser.add_argument(
         "--run-name",
@@ -232,9 +265,13 @@ def main(argv=None) -> int:
         )
         return 1
 
+    if args.hidden_dims is None:
+        hidden_dims = list(BASELINE_NETWORK["hidden_dims"])
+    else:
+        hidden_dims = args.hidden_dims
     config = {
         "task": "P4-DATA-TRAIN-01",
-        "network": dict(BASELINE_NETWORK),
+        "network": {**BASELINE_NETWORK, "hidden_dims": hidden_dims},
         "training": {
             "epochs": args.epochs,
             "batch_size": args.batch_size,

@@ -1247,3 +1247,96 @@ def test_cli_role_conflict_fails_before_training(tmp_path):
     # 校验失败发生在创建运行目录之前
     assert not out.exists() or not any(out.iterdir())
 
+
+# ---------------------------------------------------------------------------
+# P5.3-B0 新增：--hidden-dims CLI 参数（E2 架构实验能力补齐）。
+# 全部使用合成数据与临时目录，不读取真实 MNIST，不联网。
+# ---------------------------------------------------------------------------
+
+
+def test_cli_hidden_dims_parser_default_and_parse():
+    """parser 默认值为 None（由 main 回退到基线 [128]）；合法输入解析为整数列表。"""
+    from src.train_mnist import build_parser
+
+    parser = build_parser()
+    assert parser.parse_args([]).hidden_dims is None
+    assert parser.parse_args(["--hidden-dims", "128"]).hidden_dims == [128]
+    assert parser.parse_args(["--hidden-dims", "128,64"]).hidden_dims == [128, 64]
+    assert parser.parse_args(["--hidden-dims", "256,128"]).hidden_dims == [256, 128]
+
+
+@pytest.mark.parametrize(
+    "bad_dims",
+    ["", "128,,64", ",128", "128,", "128.0", "abc", "0", "-4", "128,0", "128,-64"],
+)
+def test_cli_hidden_dims_rejects_invalid_input(tmp_path, bad_dims):
+    """空串/空项/非整数/零/负数一律 argparse 报错（退出码 2），不产生任何 run 产物。"""
+    out = tmp_path / "out"
+    proc = _run_cli(["--hidden-dims", bad_dims, "--output-dir", str(out)])
+    assert proc.returncode == 2
+    combined = proc.stdout + proc.stderr
+    assert "hidden-dims" in combined          # 错误信息指向该参数
+    assert not out.exists() or not any(out.iterdir())  # 解析失败发生在任何训练之前
+
+
+def test_cli_hidden_dims_help_documents_format_and_default():
+    proc = _run_cli(["--help"])
+    assert proc.returncode == 0
+    assert "--hidden-dims" in proc.stdout
+    assert "128,64" in proc.stdout          # 帮助文本解释逗号分隔格式
+    assert "default: 128" in proc.stdout    # 帮助文本解释默认行为
+
+
+@pytest.mark.parametrize(
+    "dims_arg, expected_dims, run_name",
+    [
+        (None, [128], "hdim_default"),
+        ("64", [64], "hdim_64"),
+        ("128,64", [128, 64], "hdim_128x64"),
+        ("256,128", [256, 128], "hdim_256x128"),
+    ],
+)
+def test_cli_hidden_dims_end_to_end_config_and_training(tmp_path, dims_arg, expected_dims, run_name):
+    """端到端 synthetic run：解析值进入 config.json 且模型按该形状真实完成训练。"""
+    data_dir = _write_synthetic_mnist_dir(tmp_path / "data")
+    out = tmp_path / "out"
+    args = [
+        "--data-dir", str(data_dir), "--output-dir", str(out),
+        "--train-size", "10", "--val-size", "10", "--epochs", "1",
+        "--no-test-evaluation", "--run-name", run_name,
+    ]
+    if dims_arg is not None:
+        args += ["--hidden-dims", dims_arg]
+    proc = _run_cli(args)
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+
+    config = json.loads((out / run_name / "config.json").read_text(encoding="utf-8"))
+    assert isinstance(config["network"]["hidden_dims"], list)  # JSON 数组而非字符串
+    assert config["network"]["hidden_dims"] == expected_dims
+    summary = json.loads((out / run_name / "summary.json").read_text(encoding="utf-8"))
+    assert summary["status"] == "success"
+
+
+def test_cli_hidden_dims_multilayer_checkpoint_shapes(tmp_path):
+    """[128, 64] 端到端：checkpoint 参数形状与架构一致，证明 MLP 按指定层形状构建。"""
+    data_dir = _write_synthetic_mnist_dir(tmp_path / "data")
+    out = tmp_path / "out"
+    proc = _run_cli([
+        "--data-dir", str(data_dir), "--output-dir", str(out),
+        "--train-size", "10", "--val-size", "10", "--epochs", "2",
+        "--hidden-dims", "128,64", "--no-test-evaluation", "--run-name", "hdim_shapes",
+    ])
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+
+    run_dir = out / "hdim_shapes"
+    config = json.loads((run_dir / "config.json").read_text(encoding="utf-8"))
+    assert config["network"]["hidden_dims"] == [128, 64]
+    reference = MLP(784, [128, 64], 10, hidden_activation="relu", seed=0).params
+    params = load_checkpoint(run_dir / "best_model.npz", reference)
+    assert params["W1"].shape == (784, 128)
+    assert params["b1"].shape == (1, 128)
+    assert params["W2"].shape == (128, 64)
+    assert params["b2"].shape == (1, 64)
+    assert params["W3"].shape == (64, 10)
+    assert params["b3"].shape == (1, 10)
+

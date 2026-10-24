@@ -554,3 +554,46 @@ def test_multi_param_atomicity_on_cast_overflow(make):
     np.testing.assert_array_equal(params["over"], np.array([0.0], dtype=np.float32))
     assert params["safe"] is handles["safe"]
     assert params["over"] is handles["over"]
+
+
+# ---------------------------------------------------------------------------
+# P5.2-A-R2 整改：SGD 的目标 dtype 转换安全
+# ---------------------------------------------------------------------------
+
+
+def test_sgd_dtype_cast_overflow_rejected_atomically():
+    # float32 参数 + float64 梯度 + lr=1e40：
+    # "a_safe"（梯度 1e-40）候选 ≈ 0，可被 float32 表示，且排序在前；
+    # "b_over"（梯度 1.0）候选 ≈ -1e40，float64 下有限、写回 float32 会成为 -Inf。
+    # 旧实现会先把 a_safe 部分更新、再把 b_over 静默写成 -Inf；修复后必须整体拒绝。
+    params = {
+        "a_safe": np.array([1.0], dtype=np.float32),
+        "b_over": np.array([0.0], dtype=np.float32),
+    }
+    handles = {key: params[key] for key in params}
+    original_dtypes = {key: params[key].dtype for key in params}
+    grads = {
+        "a_safe": np.array([1e-40], dtype=np.float64),
+        "b_over": np.array([1.0], dtype=np.float64),
+    }
+    with pytest.raises(ValueError, match="casting the candidate"):
+        SGD(1e40).step(params, grads)
+    # 所有参数逐元素与调用前完全相同
+    np.testing.assert_array_equal(params["a_safe"], np.array([1.0], dtype=np.float32))
+    np.testing.assert_array_equal(params["b_over"], np.array([0.0], dtype=np.float32))
+    # 对象身份与 dtype 保持不变
+    assert params["a_safe"] is handles["a_safe"]
+    assert params["b_over"] is handles["b_over"]
+    assert params["a_safe"].dtype == original_dtypes["a_safe"]
+    assert params["b_over"].dtype == original_dtypes["b_over"]
+
+
+def test_sgd_representable_float32_update_succeeds():
+    # 可被 float32 表示的正常更新不得被转换检查误拒
+    params = {"w": np.array([1.0], dtype=np.float32)}
+    handle = params["w"]
+    SGD(0.1).step(params, {"w": np.array([0.5], dtype=np.float64)})
+    assert params["w"] is handle  # 对象身份不变
+    assert params["w"].dtype == np.float32  # dtype 保持
+    assert np.all(np.isfinite(params["w"]))  # 全部有限
+    np.testing.assert_allclose(params["w"], [1.0 - 0.1 * 0.5], rtol=1e-6, atol=0)

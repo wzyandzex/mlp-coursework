@@ -47,16 +47,22 @@ class SGD:
     def step(self, params: dict, grads: dict) -> None:
         """执行一步更新 params[key] ← params[key] − η·grads[key]（就地修改）。
 
-        分两个阶段保证“失败时无部分写入”：
+        分三个阶段保证“失败时无部分写入”：
 
         1. 准备阶段：完成全部输入校验（键集合、形状、有限性）后，在受控的
            浮点异常环境（np.errstate 显式忽略 over/invalid，随后自行检查结果）
-           下计算每个参数的候选更新值到临时数组，并验证其全部有限。
-           有限的 η 与 g 相乘仍可能溢出（如 2.0 × 1e308 → Inf），因此候选值
-           必须验证：任一候选出现 NaN/Inf 即抛出异常，所有原参数逐元素不变。
-        2. 提交阶段：所有候选都通过验证后，才统一就地写回原参数数组
-           （p[...] = candidate），保持 params[key] 指向的 ndarray 对象身份不变；
-           梯度数组全程不被修改。
+           下计算每个参数的候选更新值到临时数组，并验证其在计算 dtype 下全部
+           有限。有限的 η 与 g 相乘仍可能溢出（如 2.0 × 1e308 → Inf），因此
+           候选值必须验证：任一候选出现 NaN/Inf 即抛出异常，所有原参数逐元素
+           不变。
+        2. 目标 dtype 转换验证：候选在计算 dtype 下有限，不代表能安全写回更窄
+           的参数 dtype（如 float64 候选 -1e40 写入 float32 参数会静默变成
+           -Inf）。先对全部候选做目标 dtype 转换（dtype 相同则直接复用候选），
+           再对全部转换结果检查有限性；任一转换结果出现 NaN/Inf 即抛出异常，
+           所有原参数逐元素不变。
+        3. 提交阶段：全部转换后的候选通过验证后，才统一就地写回原参数数组
+           （p[...] = cast），保持 params[key] 指向的 ndarray 对象身份与 dtype
+           不变；梯度数组全程不被修改。
         """
         if not isinstance(params, dict):
             raise TypeError(f"params must be a dict, got {type(params).__name__}.")
@@ -97,7 +103,7 @@ class SGD:
         # 准备阶段：计算全部候选更新并验证有限性（此时不写任何参数）。
         # 溢出/无效运算在此被显式受控（忽略警告、随后自行检查结果），不依赖警告被忽略的默认行为。
         eta = self.learning_rate
-        candidates: list[tuple[np.ndarray, np.ndarray]] = []
+        candidates: list[tuple[str, np.ndarray, np.ndarray]] = []
         with np.errstate(over="ignore", invalid="ignore"):
             for key, p, g in checked:
                 candidate = p - eta * g
@@ -106,11 +112,28 @@ class SGD:
                         f"update for {key!r} would produce non-finite values "
                         f"(overflow or invalid operation); refusing to update any parameter."
                     )
-                candidates.append((p, candidate))
+                candidates.append((key, p, candidate))
 
-        # 提交阶段：全部候选有效后统一就地写回，数组对象身份不变。
-        for p, candidate in candidates:
-            p[...] = candidate
+        # 目标 dtype 转换验证：候选在计算 dtype 下有限，不代表能安全写回更窄的
+        # 参数 dtype（如 float64 候选 -1e40 写入 float32 参数会静默变成 -Inf）。
+        # 先对全部候选做目标 dtype 转换（显式管理浮点告警），再全部检查，最后
+        # 才统一提交——任何失败都不写入任何参数。
+        casted: list[tuple[str, np.ndarray, np.ndarray]] = []
+        with np.errstate(over="ignore", invalid="ignore"):
+            for key, p, candidate in candidates:
+                if candidate.dtype == p.dtype:
+                    casted.append((key, p, candidate))
+                else:
+                    casted.append((key, p, candidate.astype(p.dtype)))
+        for key, p, cast in casted:
+            if not np.all(np.isfinite(cast)):
+                raise ValueError(
+                    f"update for {key!r} overflows after casting the candidate to the "
+                    f"target parameter dtype {p.dtype}; refusing to update any parameter."
+                )
+        # 提交阶段：全部转换后的候选通过验证后统一就地写回，数组对象身份不变。
+        for _key, p, cast in casted:
+            p[...] = cast
 
 
 class _StatefulOptimizer:

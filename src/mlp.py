@@ -230,12 +230,17 @@ class MLP:
         return grads
 
     def _validate_cache(self, cache):
-        """校验 backward 收到的缓存结构，返回 (A_list, Z_list)。"""
+        """校验 backward 收到的缓存结构，返回 (A_list, Z_list)。
+
+        必需键 "A"/"Z" 用 issubset 明确检查（不能写成 set(keys) < {"A","Z"}：
+        那是“严格子集”判断，对“有 A 和杂键但缺 Z”的输入会错误放行并泄漏
+        KeyError）。A/Z 齐全时允许携带额外键。
+        """
         num_layers = self.num_layers
-        if not isinstance(cache, dict) or set(cache.keys()) < {"A", "Z"}:
+        if not isinstance(cache, dict) or not {"A", "Z"}.issubset(cache.keys()):
             raise ValueError(
-                "cache must be the dict returned by forward(..., return_cache=True) "
-                "with keys 'A' and 'Z'."
+                "cache must be a dict containing the required keys 'A' and 'Z', "
+                "as returned by forward(..., return_cache=True)."
             )
         a_list, z_list = cache["A"], cache["Z"]
         if not isinstance(a_list, (list, tuple)) or not isinstance(z_list, (list, tuple)):

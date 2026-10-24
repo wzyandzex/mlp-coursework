@@ -92,6 +92,30 @@ def test_sgd_validation_is_atomic():
     np.testing.assert_array_equal(params["a"], [1.0])
 
 
+def test_sgd_rejects_overflowing_candidate_update_atomically():
+    # 回归（审查 R1）：输入全部有限，但候选更新 η·g 溢出为 Inf 时，
+    # 必须整体拒绝，任何参数（包括排序在前、单独更新本不会溢出的那个）
+    # 都不得被部分写入，且参数 ndarray 对象身份保持不变。
+    params = {
+        "a_safe": np.array([1.0, -2.0]),   # 梯度 1.0：单独更新不会溢出
+        "b_over": np.array([[3.0]]),       # 梯度 1e308，η=2.0 → 2e308 溢出为 Inf
+    }
+    grads = {
+        "a_safe": np.array([1.0, 1.0]),
+        "b_over": np.array([[1e308]]),
+    }
+    before = {key: value.copy() for key, value in params.items()}
+    handles = {key: params[key] for key in params}
+    assert sorted(params) == ["a_safe", "b_over"]  # 保证安全参数排在更新序列前面
+
+    with pytest.raises(ValueError, match="non-finite"):
+        SGD(2.0).step(params, grads)
+
+    for key in params:
+        np.testing.assert_array_equal(params[key], before[key])  # 逐元素完全不变
+        assert params[key] is handles[key]                        # 对象身份不变
+
+
 def test_sgd_rejects_non_dict_and_bad_dtypes():
     with pytest.raises(TypeError):
         SGD(0.1).step([("w", np.array([1.0]))], {"w": np.array([0.1])})  # params 非字典

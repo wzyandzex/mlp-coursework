@@ -1,4 +1,5 @@
-# 当前阶段（P3-CORE-01）所需依赖：仅 NumPy 与 pytest
+# 当前阶段（P3-CORE-01）所需依赖：仅 NumPy 与 pytest（带合理上界，降低大版本升级风险）
+# 实际验证环境：Python 3.11.4、numpy 2.4.6、pytest 9.1.1
 # 不安装任何深度学习框架
-numpy>=1.26
-pytest>=7.4
+numpy>=1.26,<3.0
+pytest>=7.4,<10.0

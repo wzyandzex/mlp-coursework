@@ -32,8 +32,16 @@ class SGD:
     def step(self, params: dict, grads: dict) -> None:
         """执行一步更新 params[key] ← params[key] − η·grads[key]（就地修改）。
 
-        先完整校验（键集合、形状、有限性），全部通过后才统一更新，
-        因此任何校验失败都不会产生“部分更新”。
+        分两个阶段保证“失败时无部分写入”：
+
+        1. 准备阶段：完成全部输入校验（键集合、形状、有限性）后，在受控的
+           浮点异常环境（np.errstate 显式忽略 over/invalid，随后自行检查结果）
+           下计算每个参数的候选更新值到临时数组，并验证其全部有限。
+           有限的 η 与 g 相乘仍可能溢出（如 2.0 × 1e308 → Inf），因此候选值
+           必须验证：任一候选出现 NaN/Inf 即抛出异常，所有原参数逐元素不变。
+        2. 提交阶段：所有候选都通过验证后，才统一就地写回原参数数组
+           （p[...] = candidate），保持 params[key] 指向的 ndarray 对象身份不变；
+           梯度数组全程不被修改。
         """
         if not isinstance(params, dict):
             raise TypeError(f"params must be a dict, got {type(params).__name__}.")
@@ -49,7 +57,7 @@ class SGD:
                 f"keys missing from params: {missing}; unexpected keys in params: {unexpected}."
             )
 
-        checked: list[tuple[np.ndarray, np.ndarray]] = []
+        checked: list[tuple[str, np.ndarray, np.ndarray]] = []
         for key in sorted(param_keys):
             p, g = params[key], grads[key]
             if not isinstance(p, np.ndarray):
@@ -69,8 +77,22 @@ class SGD:
                 raise ValueError(f"param {key!r} contains non-finite values; refusing to update.")
             if not np.all(np.isfinite(g)):
                 raise ValueError(f"grad {key!r} contains non-finite values; refusing to update.")
-            checked.append((p, g))
+            checked.append((key, p, g))
 
+        # 准备阶段：计算全部候选更新并验证有限性（此时不写任何参数）。
+        # 溢出/无效运算在此被显式受控（忽略警告、随后自行检查结果），不依赖警告被忽略的默认行为。
         eta = self.learning_rate
-        for p, g in checked:
-            p -= eta * g
+        candidates: list[tuple[np.ndarray, np.ndarray]] = []
+        with np.errstate(over="ignore", invalid="ignore"):
+            for key, p, g in checked:
+                candidate = p - eta * g
+                if not np.all(np.isfinite(candidate)):
+                    raise ValueError(
+                        f"update for {key!r} would produce non-finite values "
+                        f"(overflow or invalid operation); refusing to update any parameter."
+                    )
+                candidates.append((p, candidate))
+
+        # 提交阶段：全部候选有效后统一就地写回，数组对象身份不变。
+        for p, candidate in candidates:
+            p[...] = candidate

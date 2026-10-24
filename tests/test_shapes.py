@@ -175,6 +175,30 @@ def test_backward_and_cache_validation():
         mlp.backward(dlogits, bad)
 
 
+def test_backward_cache_missing_required_keys_rejected_cleanly():
+    # 回归（审查 R2）：必需键校验必须用 issubset 判断；否则
+    # {"A": ..., "unexpected": ...}（有 A 和杂键、缺 Z）会绕过校验并泄漏 KeyError。
+    mlp = MLP(4, [5], 3, hidden_activation="tanh", seed=0)
+    X = np.random.default_rng(10).normal(size=(3, 4))
+    y = np.array([0, 1, 2])
+    logits, cache = mlp.forward(X, return_cache=True)
+    _, dlogits = softmax_cross_entropy(logits, y)
+
+    bad_caches = [
+        ["not", "a", "dict"],                                    # 非 dict
+        {},                                                      # 空 dict
+        {"A": cache["A"]},                                       # 只有 "A"，缺 "Z"
+        {"A": cache["A"], "unexpected": cache["A"]},             # 有 "A" 和杂键，缺 "Z"
+    ]
+    for bad in bad_caches:
+        with pytest.raises(ValueError, match="cache"):  # 友好异常，而不是 KeyError
+            mlp.backward(dlogits, bad)
+
+    # A/Z 齐全时允许携带额外键（保留现有设计意图）
+    grads = mlp.backward(dlogits, {"A": cache["A"], "Z": cache["Z"], "extra": 1})
+    assert set(grads) == set(mlp.params)
+
+
 def test_backward_does_not_modify_params_or_dlogits():
     mlp = MLP(4, [5, 6], 3, hidden_activation="sigmoid", seed=0)
     X = np.random.default_rng(8).normal(size=(3, 4))

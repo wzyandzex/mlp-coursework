@@ -5,6 +5,10 @@ __pycache__/
 # pytest
 .pytest_cache/
 
+# MNIST 原始数据与本地训练产物：只保留在本地，绝不提交仓库
+data/
+outputs/
+
 # IDE
 .idea/
 .vscode/

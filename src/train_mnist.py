@@ -170,6 +170,14 @@ def build_parser() -> argparse.ArgumentParser:
         "Default: 128, i.e. the baseline 784-[128]-10.",
     )
     parser.add_argument(
+        "--hidden-activation",
+        choices=("relu", "tanh", "sigmoid"),
+        default=None,
+        help="Hidden layer activation function: relu, tanh, or sigmoid (default: relu). "
+        "With initializer=auto, hidden layers use He normal for relu and "
+        "Xavier normal for tanh/sigmoid.",
+    )
+    parser.add_argument(
         "--run-name",
         default=None,
         help="Optional run directory name under --output-dir; defaults to a timestamp.",
@@ -269,9 +277,17 @@ def main(argv=None) -> int:
         hidden_dims = list(BASELINE_NETWORK["hidden_dims"])
     else:
         hidden_dims = args.hidden_dims
+    if args.hidden_activation is None:
+        hidden_activation = BASELINE_NETWORK["hidden_activation"]
+    else:
+        hidden_activation = args.hidden_activation
     config = {
         "task": "P4-DATA-TRAIN-01",
-        "network": {**BASELINE_NETWORK, "hidden_dims": hidden_dims},
+        "network": {
+            **BASELINE_NETWORK,
+            "hidden_dims": hidden_dims,
+            "hidden_activation": hidden_activation,
+        },
         "training": {
             "epochs": args.epochs,
             "batch_size": args.batch_size,

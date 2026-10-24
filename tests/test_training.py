@@ -1340,3 +1340,102 @@ def test_cli_hidden_dims_multilayer_checkpoint_shapes(tmp_path):
     assert params["W3"].shape == (64, 10)
     assert params["b3"].shape == (1, 10)
 
+
+# ---------------------------------------------------------------------------
+# P5.3-C0 新增：--hidden-activation CLI 参数（E3 激活实验能力补齐）。
+# 全部使用合成数据与临时目录，不读取真实 MNIST，不联网。
+# ---------------------------------------------------------------------------
+
+
+def test_cli_hidden_activation_parser_and_help():
+    """parser 默认 None（main 回退基线 relu）；help 显示参数、三个合法选项与默认值。"""
+    from src.train_mnist import build_parser
+
+    parser = build_parser()
+    assert parser.parse_args([]).hidden_activation is None
+    for value in ("relu", "tanh", "sigmoid"):
+        assert parser.parse_args(["--hidden-activation", value]).hidden_activation == value
+
+    proc = _run_cli(["--help"])
+    assert proc.returncode == 0
+    assert "--hidden-activation" in proc.stdout
+    for value in ("relu", "tanh", "sigmoid"):
+        assert value in proc.stdout
+    assert "default: relu" in proc.stdout
+
+
+@pytest.mark.parametrize("activation", ["relu", "tanh", "sigmoid"])
+def test_cli_hidden_activation_end_to_end_config(tmp_path, activation):
+    """三个合法激活值各跑一次端到端 synthetic run：config 记录一致、initializer 仍 auto、训练正常结束。"""
+    data_dir = _write_synthetic_mnist_dir(tmp_path / "data")
+    out = tmp_path / "out"
+    run_name = f"act_{activation}"
+    proc = _run_cli([
+        "--data-dir", str(data_dir), "--output-dir", str(out),
+        "--train-size", "10", "--val-size", "10", "--epochs", "1",
+        "--hidden-activation", activation, "--no-test-evaluation",
+        "--run-name", run_name,
+    ])
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+    config = json.loads((out / run_name / "config.json").read_text(encoding="utf-8"))
+    assert config["network"]["hidden_activation"] == activation
+    assert config["network"]["initializer"] == "auto"
+    assert config["network"]["hidden_dims"] == [128]  # 默认网络不受激活选择影响
+    summary = json.loads((out / run_name / "summary.json").read_text(encoding="utf-8"))
+    assert summary["status"] == "success"
+
+
+def test_cli_hidden_activation_reaches_run_experiment(tmp_path, monkeypatch):
+    """spy 证据：--hidden-activation 的值进入实际传给 run_experiment() 的 config 并真实参与训练。"""
+    import src.train_mnist as cli
+
+    data_dir = _write_synthetic_mnist_dir(tmp_path / "data")
+    out = tmp_path / "out"
+    captured = {}
+    real_run_experiment = cli.run_experiment
+
+    def spy(**kwargs):
+        captured["config"] = kwargs["config"]
+        return real_run_experiment(**kwargs)
+
+    monkeypatch.setattr(cli, "run_experiment", spy)
+    rc = cli.main([
+        "--data-dir", str(data_dir), "--output-dir", str(out),
+        "--train-size", "10", "--val-size", "10", "--epochs", "1",
+        "--hidden-activation", "tanh", "--no-test-evaluation",
+        "--run-name", "act_spy",
+    ])
+    assert rc == 0
+    assert captured["config"]["network"]["hidden_activation"] == "tanh"
+    assert captured["config"]["network"]["initializer"] == "auto"
+    # spy 捕获的 config 与落盘 config.json 一致（同一 dict 的序列化产物）
+    saved = json.loads((out / "act_spy" / "config.json").read_text(encoding="utf-8"))
+    assert saved["network"]["hidden_activation"] == "tanh"
+    assert (out / "act_spy" / "summary.json").is_file()  # 真实 run_experiment 完成
+
+
+@pytest.mark.parametrize("bad_activation", ["bogus", "RELU", "Tanh", ""])
+def test_cli_hidden_activation_rejects_invalid(tmp_path, bad_activation):
+    """未知值/大小写不符/空值一律 argparse 拒绝（退出码 2），失败前不产生 run 产物。"""
+    out = tmp_path / "out"
+    proc = _run_cli(["--hidden-activation", bad_activation, "--output-dir", str(out)])
+    assert proc.returncode == 2
+    combined = proc.stdout + proc.stderr
+    assert "hidden-activation" in combined
+    assert not out.exists() or not any(out.iterdir())
+
+
+def test_cli_hidden_activation_default_path_unchanged(tmp_path):
+    """不传 --hidden-activation：config 仍为 relu、[128]，与既有默认行为一致。"""
+    data_dir = _write_synthetic_mnist_dir(tmp_path / "data")
+    out = tmp_path / "out"
+    proc = _run_cli([
+        "--data-dir", str(data_dir), "--output-dir", str(out),
+        "--train-size", "10", "--val-size", "10", "--epochs", "1",
+        "--no-test-evaluation", "--run-name", "act_default",
+    ])
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+    config = json.loads((out / "act_default" / "config.json").read_text(encoding="utf-8"))
+    assert config["network"]["hidden_activation"] == "relu"
+    assert config["network"]["hidden_dims"] == [128]
+

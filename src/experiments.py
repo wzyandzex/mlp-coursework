@@ -45,6 +45,13 @@ EVALUATION_STATES = ("executed", "not_run")
 # 角色 → 是否必须执行测试评估（P5.2-C 契约）
 ROLE_EXPECTS_EVALUATION = {"baseline": True, "exploration": False, "final": True}
 
+# 当前（P5.2-C）schema 的合法枚举值，与训练入口/CLI 的既有校验保持一致
+_NETWORK_ACTIVATIONS = ("relu", "sigmoid", "tanh")
+_INITIALIZER_CHOICES = ("auto", "he_normal", "xavier_normal")
+_OPTIMIZER_CHOICES = ("sgd", "momentum_sgd", "adam")
+_SCHEDULER_CHOICES = ("none", "step")
+_STOP_REASONS = ("max_epochs", "early_stopping")
+
 RUN_CSV_FIELDS = (
     "run_name",
     "run_path",
@@ -106,11 +113,13 @@ def _reject_json_constant(name: str) -> float:
 
 
 def _is_finite_number(value) -> bool:
-    return (
-        isinstance(value, (int, float))
-        and not isinstance(value, bool)
-        and math.isfinite(value)
-    )
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return False
+    try:
+        # 极大整数（如 10**400）转 float 会 OverflowError：视为超出可表示范围
+        return math.isfinite(value)
+    except (OverflowError, ValueError):
+        return False
 
 
 def _load_json_file(path: Path):
@@ -135,6 +144,88 @@ def _dumpable(data) -> bool:
         return True
     except (TypeError, ValueError):
         return False
+
+
+# ---------- 当前 schema 字段校验辅助 ----------
+
+
+def _require_int(container: dict, key: str, section: str, diagnostics: list, minimum=None):
+    """整数型字段：拒绝 bool、非整数类型与越界；缺键/非法都写入诊断。"""
+    if key not in container:
+        diagnostics.append(f"{section} missing required field {key!r}")
+        return None
+    value = container[key]
+    if isinstance(value, bool) or not isinstance(value, int):
+        diagnostics.append(f"{section}.{key} must be an integer, got {value!r}")
+        return None
+    if minimum is not None and value < minimum:
+        diagnostics.append(f"{section}.{key} must be >= {minimum}, got {value!r}")
+        return None
+    return value
+
+
+def _require_number(container: dict, key: str, section: str, diagnostics: list,
+                    minimum=None, maximum=None, exclusive_min=False, exclusive_max=False):
+    """数值型字段：拒绝 bool、非数值、NaN/Inf 与越界（浮点范围转换失败也视为非法）。"""
+    if key not in container:
+        diagnostics.append(f"{section} missing required field {key!r}")
+        return None
+    value = container[key]
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        diagnostics.append(f"{section}.{key} must be a number, got {value!r}")
+        return None
+    try:
+        finite = math.isfinite(value)
+    except (OverflowError, ValueError):
+        finite = False
+    if not finite:
+        diagnostics.append(f"{section}.{key} must be a finite number, got {value!r}")
+        return None
+    value = float(value)
+    if minimum is not None and (value <= minimum if exclusive_min else value < minimum):
+        op = ">" if exclusive_min else ">="
+        diagnostics.append(f"{section}.{key} must be {op} {minimum}, got {value!r}")
+        return None
+    if maximum is not None and (value >= maximum if exclusive_max else value > maximum):
+        op = "<" if exclusive_max else "<="
+        diagnostics.append(f"{section}.{key} must be {op} {maximum}, got {value!r}")
+        return None
+    return value
+
+
+def _require_enum(container: dict, key: str, section: str, diagnostics: list, choices: tuple):
+    if key not in container:
+        diagnostics.append(f"{section} missing required field {key!r}")
+        return None
+    value = container[key]
+    if not isinstance(value, str) or value not in choices:
+        diagnostics.append(
+            f"{section}.{key} must be one of {', '.join(repr(c) for c in choices)}, got {value!r}"
+        )
+        return None
+    return value
+
+
+def _require_bool(container: dict, key: str, section: str, diagnostics: list) -> bool:
+    if key not in container:
+        diagnostics.append(f"{section} missing required field {key!r}")
+        return False
+    value = container[key]
+    if not isinstance(value, bool):
+        diagnostics.append(f"{section}.{key} must be a JSON boolean, got {value!r}")
+        return False
+    return True
+
+
+def _require_string(container: dict, key: str, section: str, diagnostics: list):
+    if key not in container:
+        diagnostics.append(f"{section} missing required field {key!r}")
+        return None
+    value = container[key]
+    if not isinstance(value, str) or not value:
+        diagnostics.append(f"{section}.{key} must be a non-empty string, got {value!r}")
+        return None
+    return value
 
 
 def discover_run_dirs(root: Path, exclude: Path | None = None) -> list:
@@ -196,17 +287,193 @@ def _fill_fields(record: dict, config: dict | None, summary: dict | None) -> Non
             record["experiment_role"] = summary.get("experiment_role")
 
 
-def _validate_current_schema(config: dict, summary: dict, diagnostics: list) -> bool:
-    """P5.2-C schema 的完整校验：返回 True 表示可作为 success 记录。"""
+def _validate_config_schema(config: dict, diagnostics: list) -> bool:
+    """config.json 的 P5.2-C schema 校验：必需字段、类型与数值范围。
+
+    数值约束与训练入口/CLI 的既有校验一致；缺键、类型错误、显式 null 都写入
+    诊断并判 invalid，绝不静默补默认值。所有 _require_* 辅助函数以
+    "None=失败、非 None=成功" 返回，调用处必须把结果传播到 ok。
+    """
     ok = True
+    for name in ("task", "network", "training", "seeds", "data", "environment",
+                 "experiment_role", "evaluate_test"):
+        if name not in config:
+            diagnostics.append(f"config.json missing required field {name!r}")
+            ok = False
+
+    network = config.get("network")
+    if isinstance(network, dict):
+        ok = _require_int(network, "input_dim", "network", diagnostics, minimum=1) is not None and ok
+        ok = _require_int(network, "output_dim", "network", diagnostics, minimum=1) is not None and ok
+        hidden_dims = network.get("hidden_dims")
+        if (not isinstance(hidden_dims, list) or not hidden_dims
+                or any(isinstance(w, bool) or not isinstance(w, int) or w < 1
+                       for w in hidden_dims)):
+            diagnostics.append(
+                f"network.hidden_dims must be a non-empty list of positive integers, "
+                f"got {hidden_dims!r}"
+            )
+            ok = False
+        ok = _require_enum(network, "hidden_activation", "network", diagnostics,
+                           _NETWORK_ACTIVATIONS) is not None and ok
+        ok = _require_enum(network, "initializer", "network", diagnostics,
+                           _INITIALIZER_CHOICES) is not None and ok
+    elif "network" in config:
+        diagnostics.append(f"config field 'network' must be an object, got {network!r}")
+        ok = False
+
+    training = config.get("training")
+    if isinstance(training, dict):
+        for key in ("epochs", "batch_size", "eval_batch_size", "step_size", "patience"):
+            ok = _require_int(training, key, "training", diagnostics, minimum=1) is not None and ok
+        ok = _require_number(training, "learning_rate", "training", diagnostics,
+                             minimum=0.0, exclusive_min=True) is not None and ok
+        ok = _require_number(training, "eps", "training", diagnostics,
+                             minimum=0.0, exclusive_min=True) is not None and ok
+        ok = _require_number(training, "momentum", "training", diagnostics,
+                             minimum=0.0, maximum=1.0, exclusive_max=True) is not None and ok
+        ok = _require_number(training, "beta1", "training", diagnostics,
+                             minimum=0.0, maximum=1.0, exclusive_max=True) is not None and ok
+        ok = _require_number(training, "beta2", "training", diagnostics,
+                             minimum=0.0, maximum=1.0, exclusive_max=True) is not None and ok
+        ok = _require_number(training, "gamma", "training", diagnostics,
+                             minimum=0.0, exclusive_min=True, maximum=1.0) is not None and ok
+        ok = _require_number(training, "min_delta", "training", diagnostics,
+                             minimum=0.0) is not None and ok
+        ok = _require_number(training, "l2_lambda", "training", diagnostics,
+                             minimum=0.0) is not None and ok
+        ok = _require_enum(training, "optimizer", "training", diagnostics,
+                           _OPTIMIZER_CHOICES) is not None and ok
+        ok = _require_enum(training, "lr_scheduler", "training", diagnostics,
+                           _SCHEDULER_CHOICES) is not None and ok
+        ok = _require_bool(training, "early_stopping", "training", diagnostics) and ok
+    elif "training" in config:
+        diagnostics.append(f"config field 'training' must be an object, got {training!r}")
+        ok = False
+
+    seeds = config.get("seeds")
+    if isinstance(seeds, dict):
+        ok = _require_int(seeds, "model_seed", "seeds", diagnostics, minimum=0) is not None and ok
+        ok = _require_int(seeds, "split_seed", "seeds", diagnostics, minimum=0) is not None and ok
+    elif "seeds" in config:
+        diagnostics.append(f"config field 'seeds' must be an object, got {seeds!r}")
+        ok = False
+
+    data = config.get("data")
+    if isinstance(data, dict):
+        ok = _require_string(data, "source_dir", "data", diagnostics) is not None and ok
+        ok = _require_int(data, "train_size", "data", diagnostics, minimum=1) is not None and ok
+        ok = _require_int(data, "val_size", "data", diagnostics, minimum=1) is not None and ok
+        ok = _require_string(data, "split_strategy", "data", diagnostics) is not None and ok
+        sample_counts = data.get("sample_counts")
+        if isinstance(sample_counts, dict):
+            for name in ("train", "validation", "test"):
+                ok = _require_int(sample_counts, name, "data.sample_counts",
+                                  diagnostics, minimum=0) is not None and ok
+        elif "sample_counts" in data:
+            diagnostics.append(
+                f"data.sample_counts must be an object with non-negative integer "
+                f"train/validation/test counts, got {sample_counts!r}"
+            )
+            ok = False
+    elif "data" in config:
+        diagnostics.append(f"config field 'data' must be an object, got {data!r}")
+        ok = False
+
+    environment = config.get("environment")
+    if isinstance(environment, dict):
+        for name in ("python", "numpy", "platform"):
+            ok = _require_string(environment, name, "environment", diagnostics) is not None and ok
+    elif "environment" in config:
+        diagnostics.append(f"config field 'environment' must be an object, got {environment!r}")
+        ok = False
+
+    ok = _require_enum(config, "experiment_role", "config", diagnostics, ROLES) is not None and ok
+    ok = _require_bool(config, "evaluate_test", "config", diagnostics) and ok
+    ok = _require_string(config, "task", "config", diagnostics) is not None and ok
+    return ok
+
+
+def _validate_summary_schema(summary: dict, diagnostics: list) -> bool:
+    """summary.json 的 P5.2-C schema 校验（单文件层面；跨文件一致性见主校验）。"""
+    ok = True
+    for name in ("status", "run_dir", "experiment_role", "test_evaluation", "stop_reason",
+                 "best_epoch", "best_validation_loss", "best_validation_accuracy",
+                 "test_loss", "test_accuracy", "sample_counts", "epochs_completed",
+                 "total_seconds"):
+        if name not in summary:
+            diagnostics.append(f"summary.json missing required field {name!r}")
+            ok = False
+
+    status = summary.get("status")
+    if status != "success":
+        # 不能因为有指标就把 status 为 failed/其他值的 run 判为 success
+        diagnostics.append(f"summary field 'status' must be 'success', got {status!r}")
+        ok = False
+    ok = _require_string(summary, "run_dir", "summary", diagnostics) is not None and ok
+    ok = _require_enum(summary, "experiment_role", "summary", diagnostics, ROLES) is not None and ok
+    ok = _require_enum(summary, "test_evaluation", "summary", diagnostics,
+                       EVALUATION_STATES) is not None and ok
+    ok = _require_enum(summary, "stop_reason", "summary", diagnostics,
+                       _STOP_REASONS) is not None and ok
+
+    best_epoch = _require_int(summary, "best_epoch", "summary", diagnostics, minimum=1)
+    ok = best_epoch is not None and ok
+    epochs_completed = _require_int(summary, "epochs_completed", "summary",
+                                    diagnostics, minimum=1)
+    ok = epochs_completed is not None and ok
+    if best_epoch is not None and epochs_completed is not None and best_epoch > epochs_completed:
+        diagnostics.append(
+            f"summary best_epoch ({best_epoch}) exceeds epochs_completed ({epochs_completed})"
+        )
+        ok = False
+    ok = _require_number(summary, "best_validation_loss", "summary", diagnostics,
+                         minimum=0.0) is not None and ok
+    ok = _require_number(summary, "best_validation_accuracy", "summary", diagnostics,
+                         minimum=0.0, maximum=1.0) is not None and ok
+    ok = _require_number(summary, "total_seconds", "summary", diagnostics,
+                         minimum=0.0) is not None and ok
+
+    test_evaluation = summary.get("test_evaluation")
+    if test_evaluation == "executed":
+        ok = _require_number(summary, "test_loss", "summary", diagnostics,
+                             minimum=0.0) is not None and ok
+        ok = _require_number(summary, "test_accuracy", "summary", diagnostics,
+                             minimum=0.0, maximum=1.0) is not None and ok
+    elif test_evaluation == "not_run":
+        for name in ("test_loss", "test_accuracy"):
+            if summary.get(name) is not None:
+                diagnostics.append(
+                    f"summary field {name!r} must be null when test_evaluation is "
+                    f"'not_run', got {summary[name]!r}"
+                )
+                ok = False
+
+    sample_counts = summary.get("sample_counts")
+    if isinstance(sample_counts, dict):
+        for name in ("train", "validation", "test"):
+            ok = _require_int(sample_counts, name, "summary.sample_counts",
+                              diagnostics, minimum=0) is not None and ok
+    elif "sample_counts" in summary:
+        diagnostics.append(
+            f"summary field 'sample_counts' must be an object with non-negative integer "
+            f"train/validation/test counts, got {sample_counts!r}"
+        )
+        ok = False
+    return ok
+
+
+def _validate_current_schema(config: dict, summary: dict, diagnostics: list) -> bool:
+    """P5.2-C 当前 schema 的完整校验：config + summary + 跨文件一致性。
+
+    返回 True 表示可作为 success 记录；任何缺键、显式 null、类型错误、
+    越界数值或不一致都会写入定位到字段的诊断并判 invalid。
+    """
+    ok = _validate_config_schema(config, diagnostics)
+    ok = _validate_summary_schema(summary, diagnostics) and ok
+
+    # 跨文件一致性
     role = config.get("experiment_role")
-    if role not in ROLES:
-        diagnostics.append(f"invalid experiment_role {role!r} in config.json")
-        ok = False
-    eval_state = summary.get("test_evaluation")
-    if eval_state not in EVALUATION_STATES:
-        diagnostics.append(f"invalid test_evaluation {eval_state!r} in summary.json")
-        ok = False
     summary_role = summary.get("experiment_role")
     if summary_role != role:
         diagnostics.append(
@@ -214,6 +481,7 @@ def _validate_current_schema(config: dict, summary: dict, diagnostics: list) -> 
             f"summary.json ({summary_role!r})"
         )
         ok = False
+    eval_state = summary.get("test_evaluation")
     if role in ROLE_EXPECTS_EVALUATION and eval_state in EVALUATION_STATES:
         expects_executed = ROLE_EXPECTS_EVALUATION[role]
         if (eval_state == "executed") != expects_executed:
@@ -223,15 +491,13 @@ def _validate_current_schema(config: dict, summary: dict, diagnostics: list) -> 
             )
             ok = False
     config_evaluate = config.get("evaluate_test")
-    if not isinstance(config_evaluate, bool):
-        diagnostics.append(f"evaluate_test in config.json must be a bool, got {config_evaluate!r}")
-        ok = False
-    elif role in ROLE_EXPECTS_EVALUATION and config_evaluate != ROLE_EXPECTS_EVALUATION[role]:
-        diagnostics.append(
-            f"experiment_role {role!r} is inconsistent with evaluate_test={config_evaluate!r} "
-            f"in config.json (expected {ROLE_EXPECTS_EVALUATION[role]!r})"
-        )
-        ok = False
+    if isinstance(config_evaluate, bool) and eval_state in EVALUATION_STATES:
+        if (eval_state == "executed") != config_evaluate:
+            diagnostics.append(
+                f"evaluate_test={config_evaluate!r} in config.json is inconsistent with "
+                f"test_evaluation={eval_state!r} in summary.json"
+            )
+            ok = False
     if eval_state == "executed":
         for name in ("test_loss", "test_accuracy"):
             value = summary.get(name)
@@ -250,28 +516,43 @@ def _validate_current_schema(config: dict, summary: dict, diagnostics: list) -> 
                     f"'not_run', got {value!r}"
                 )
                 ok = False
-    for name in ("best_validation_loss", "best_validation_accuracy",
-                 "epochs_completed", "total_seconds"):
-        if not _is_finite_number(summary.get(name)):
+    # sample_counts 跨文件一致性
+    config_counts = (config.get("data") or {}).get("sample_counts")
+    summary_counts = summary.get("sample_counts")
+    if isinstance(config_counts, dict) and isinstance(summary_counts, dict):
+        keys = ("train", "validation", "test")
+        normalized_config = {key: config_counts.get(key) for key in keys}
+        normalized_summary = {key: summary_counts.get(key) for key in keys}
+        if normalized_config != normalized_summary:
             diagnostics.append(
-                f"summary field {name!r} must be a finite number, got {summary.get(name)!r}"
+                f"summary.sample_counts {normalized_summary!r} does not match "
+                f"config.data.sample_counts {normalized_config!r}"
             )
             ok = False
-    best_epoch = summary.get("best_epoch")
-    if isinstance(best_epoch, bool) or not isinstance(best_epoch, int):
-        diagnostics.append(f"summary field 'best_epoch' must be an integer, got {best_epoch!r}")
-        ok = False
-    stop_reason = summary.get("stop_reason")
-    if stop_reason not in ("max_epochs", "early_stopping"):
-        diagnostics.append(f"summary field 'stop_reason' has unexpected value {stop_reason!r}")
-        ok = False
-    for name, section in (("training", config.get("training")),
-                          ("seeds", config.get("seeds")),
-                          ("network", config.get("network"))):
-        if not isinstance(section, dict):
-            diagnostics.append(f"config.json missing {name!r} object")
-            ok = False
     return ok
+
+
+def _legacy_present_field_issues(config: dict, summary: dict) -> list:
+    """legacy 候选中，已存在字段若有明确非法类型/枚举值，优先判 invalid。"""
+    issues = []
+    if "experiment_role" in config and config["experiment_role"] not in ROLES:
+        issues.append(
+            f"invalid experiment_role {config['experiment_role']!r} in config.json"
+        )
+    if "test_evaluation" in summary and summary["test_evaluation"] not in EVALUATION_STATES:
+        issues.append(
+            f"invalid test_evaluation {summary['test_evaluation']!r} in summary.json"
+        )
+    if "experiment_role" in summary and summary["experiment_role"] not in ROLES:
+        issues.append(
+            f"invalid experiment_role {summary['experiment_role']!r} in summary.json"
+        )
+    if "evaluate_test" in config and not isinstance(config["evaluate_test"], bool):
+        issues.append(
+            f"evaluate_test in config.json must be a JSON boolean, "
+            f"got {config['evaluate_test']!r}"
+        )
+    return issues
 
 
 def build_run_record(run_dir: Path, root: Path) -> dict:
@@ -371,17 +652,35 @@ def build_run_record(run_dir: Path, root: Path) -> dict:
         _fill_fields(record, config or {}, summary or {})
         return record
 
-    # 旧 schema：缺少角色/评估状态字段 → legacy，不自动推导测试集状态
-    if config.get("experiment_role") is None or summary.get("test_evaluation") is None:
+    # 旧 schema 判定：仅当对应键确实不存在时才可判 legacy；
+    # 键存在但值为 JSON null 属于当前 schema 的显式无效值 → invalid；
+    # 若缺失判别字段的同时、其它已存在字段有明确非法类型/枚举值，
+    # 优先判 invalid（不得把已确认的 schema 损坏掩盖成 legacy）。
+    role_key_missing = "experiment_role" not in config
+    te_key_missing = "test_evaluation" not in summary
+    if role_key_missing or te_key_missing:
+        if role_key_missing:
+            diagnostics.append("missing experiment_role in config.json")
+        if te_key_missing:
+            diagnostics.append("missing test_evaluation in summary.json")
+        present_issues = _legacy_present_field_issues(config, summary)
+        if present_issues:
+            record["status"] = STATUS_INVALID
+            diagnostics.extend(present_issues)
+            diagnostics.append(
+                "present fields contain explicit schema damage; classified as invalid "
+                "instead of legacy"
+            )
+            _fill_fields(record, config, summary)
+            return record
         record["status"] = STATUS_LEGACY
-        missing = []
-        if config.get("experiment_role") is None:
-            missing.append("experiment_role in config.json")
-        if summary.get("test_evaluation") is None:
-            missing.append("test_evaluation in summary.json")
         diagnostics.append(
-            "run predates the P5.2-C schema (missing " + "; ".join(missing) + "); "
-            "its test-set state cannot be verified and is not derived"
+            "run predates the P5.2-C schema (missing "
+            + "; ".join(filter(None, [
+                "experiment_role in config.json" if role_key_missing else None,
+                "test_evaluation in summary.json" if te_key_missing else None,
+            ]))
+            + "); its test-set state cannot be verified and is not derived"
         )
         _fill_fields(record, config, summary)
         return record

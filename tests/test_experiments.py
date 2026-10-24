@@ -312,6 +312,165 @@ def test_legacy_run_without_role_fields(tmp_path):
     assert report["counts"]["legacy"] == 1
 
 
+# ---------------------------------------------------------------------------
+# P5.2-D-R1 整改：当前 schema 严格校验、legacy/null 区分与极端数值防护
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    "section, key",
+    [
+        ("training", "optimizer"),
+        ("training", "learning_rate"),
+        ("seeds", "model_seed"),
+        ("network", "input_dim"),
+        ("environment", "python"),
+    ],
+)
+def test_missing_required_config_fields_marked_invalid(tmp_path, section, key):
+    # 删除任一当前 schema 必需字段都必须判 invalid（而非 success/legacy）
+    root = tmp_path / "outputs"
+    config = _make_config()
+    del config[section][key]
+    _write_run(root, "missing_field", config=config, summary=_make_summary())
+    report = aggregate(root=root, output=root / "_aggregate")
+    runs = {record["run_name"]: record
+            for record in _read_json(root / "_aggregate" / "runs.json")["runs"]}
+    assert runs["missing_field"]["status"] == "invalid"
+    assert any(key in diagnostic for diagnostic in runs["missing_field"]["diagnostics"])
+    assert report["counts"]["success"] == 0
+    assert report["counts"]["legacy"] == 0  # 键存在于 config → 不算 legacy
+
+
+@pytest.mark.parametrize(
+    "section, key, value, token",
+    [
+        ("training", "batch_size", True, "batch_size"),          # bool 冒充 int
+        ("training", "learning_rate", "0.1", "learning_rate"),   # 字符串冒充数字
+        ("training", "gamma", 1.5, "gamma"),                     # 越上界
+        ("training", "gamma", 0.0, "gamma"),                     # 越下界（开区间）
+        ("training", "momentum", 1.0, "momentum"),               # 越上界（开区间）
+        ("training", "l2_lambda", -0.1, "l2_lambda"),            # 负数
+        ("network", "hidden_activation", {"x": 1}, "hidden_activation"),  # 对象冒充字符串
+        ("seeds", "model_seed", False, "model_seed"),            # bool 冒充非负整数
+    ],
+)
+def test_invalid_field_types_and_ranges_marked_invalid(tmp_path, section, key, value, token):
+    root = tmp_path / "outputs"
+    config = _make_config()
+    config[section][key] = value
+    _write_run(root, "bad_type", config=config, summary=_make_summary())
+    aggregate(root=root, output=root / "_aggregate")
+    runs = {record["run_name"]: record
+            for record in _read_json(root / "_aggregate" / "runs.json")["runs"]}
+    assert runs["bad_type"]["status"] == "invalid"
+    assert any(token in diagnostic for diagnostic in runs["bad_type"]["diagnostics"])
+
+
+def test_summary_status_missing_or_not_success_is_invalid(tmp_path):
+    root = tmp_path / "outputs"
+    missing_status = _make_summary()
+    del missing_status["status"]
+    _write_run(root, "no_status", config=_make_config(), summary=missing_status)
+    failed = _make_summary(status="failed")
+    _write_run(root, "failed_run", config=_make_config(), summary=failed)
+    report = aggregate(root=root, output=root / "_aggregate")
+    runs = {record["run_name"]: record
+            for record in _read_json(root / "_aggregate" / "runs.json")["runs"]}
+    assert runs["no_status"]["status"] == "invalid"
+    assert any("missing required field 'status'" in diagnostic
+               for diagnostic in runs["no_status"]["diagnostics"])
+    assert runs["failed_run"]["status"] == "invalid"
+    assert any("'status' must be 'success'" in diagnostic
+               for diagnostic in runs["failed_run"]["diagnostics"])
+    assert report["counts"]["success"] == 0
+
+
+def test_legacy_requires_missing_key_while_explicit_null_is_invalid(tmp_path):
+    root = tmp_path / "outputs"
+    # 键缺失 → legacy（两处分别成立）
+    role_missing = _make_config()
+    del role_missing["experiment_role"]
+    _write_run(root, "role_key_missing", config=role_missing,
+               summary=_make_summary(test_evaluation="not_run"))
+    te_missing = _make_summary()
+    del te_missing["test_evaluation"]
+    _write_run(root, "te_key_missing", config=_make_config(), summary=te_missing)
+    # 键存在但值为显式 null → 当前 schema 的无效值 → invalid（不归为 legacy）
+    role_null = _make_config()
+    role_null["experiment_role"] = None
+    _write_run(root, "role_null", config=role_null, summary=_make_summary())
+    te_null = _make_summary()
+    te_null["test_evaluation"] = None
+    _write_run(root, "te_null", config=_make_config(), summary=te_null)
+    report = aggregate(root=root, output=root / "_aggregate")
+    runs = {record["run_name"]: record
+            for record in _read_json(root / "_aggregate" / "runs.json")["runs"]}
+    assert runs["role_key_missing"]["status"] == "legacy"
+    assert runs["te_key_missing"]["status"] == "legacy"
+    assert runs["role_null"]["status"] == "invalid"
+    assert any("experiment_role" in diagnostic and "None" in diagnostic
+               for diagnostic in runs["role_null"]["diagnostics"])
+    assert runs["te_null"]["status"] == "invalid"
+    assert any("test_evaluation" in diagnostic and "None" in diagnostic
+               for diagnostic in runs["te_null"]["diagnostics"])
+    assert report["counts"] == {"success": 0, "incomplete": 0, "invalid": 2, "legacy": 2}
+
+
+def test_legacy_present_field_damage_takes_precedence_over_legacy(tmp_path):
+    # experiment_role 键缺失（legacy 候选），但已存在的 test_evaluation 明确非法
+    # → 优先判 invalid，不把 schema 损坏掩盖成 legacy
+    root = tmp_path / "outputs"
+    config = _make_config()
+    del config["experiment_role"]
+    _write_run(root, "damaged", config=config,
+               summary=_make_summary(test_evaluation="banana"))
+    report = aggregate(root=root, output=root / "_aggregate")
+    runs = _read_json(root / "_aggregate" / "runs.json")["runs"]
+    assert runs[0]["status"] == "invalid"
+    assert any("banana" in diagnostic for diagnostic in runs[0]["diagnostics"])
+    assert any("instead of legacy" in diagnostic for diagnostic in runs[0]["diagnostics"])
+
+
+def test_sample_counts_mismatch_marked_invalid(tmp_path):
+    root = tmp_path / "outputs"
+    config = _make_config()  # sample_counts: train=20000
+    summary = _make_summary()
+    summary["sample_counts"]["train"] = 19000  # 与 config 不一致
+    _write_run(root, "mismatch", config=config, summary=summary)
+    aggregate(root=root, output=root / "_aggregate")
+    runs = {record["run_name"]: record
+            for record in _read_json(root / "_aggregate" / "runs.json")["runs"]}
+    assert runs["mismatch"]["status"] == "invalid"
+    assert any("sample_counts" in diagnostic and "does not match" in diagnostic
+               for diagnostic in runs["mismatch"]["diagnostics"])
+
+
+def test_extreme_integer_values_do_not_crash_aggregation(tmp_path):
+    # 极大整数（10**400）曾让 math.isfinite 抛未捕获 OverflowError 导致整个
+    # 汇总中止；修复后必须可靠标记 invalid，输出仍是可严格解析的标准 JSON
+    root = tmp_path / "outputs"
+    config = _make_config()
+    config["training"]["epochs"] = 10 ** 400  # 极大整数冒充 epochs（不崩溃即可）
+    summary = _make_summary(best_val_loss=10 ** 400)  # 极大整数冒充有限数值 → invalid
+    _write_run(root, "huge", config=config, summary=summary)
+    report = aggregate(root=root, output=root / "_aggregate")
+    runs = {record["run_name"]: record
+            for record in _read_json(root / "_aggregate" / "runs.json")["runs"]}
+    assert runs["huge"]["status"] == "invalid"
+    assert any("best_validation_loss" in diagnostic
+               for diagnostic in runs["huge"]["diagnostics"])
+    assert report["counts"]["invalid"] == 1
+    for name in ("runs.json", "groups.json", "report.json"):
+        text = (root / "_aggregate" / name).read_text(encoding="utf-8")
+
+        def reject(constant):
+            raise AssertionError(f"non-standard JSON constant {constant} in {name}")
+
+        json.loads(text, parse_constant=reject)  # 严格 JSON parser 可读取
+    assert (root / "_aggregate" / "runs.csv").read_text(encoding="utf-8")  # CSV 非空可读
+
+
 # ---------- 8. 输入与输出目录的边界行为 ----------
 
 

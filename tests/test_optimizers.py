@@ -479,3 +479,78 @@ def test_stateful_optimizers_do_not_modify_grads(make):
     opt.step(params, grads)  # 多步后仍不变
     for key in grads:
         np.testing.assert_array_equal(grads[key], grads_snapshot[key])
+
+
+# ---------------------------------------------------------------------------
+# P5.2-A-R1 整改：目标 dtype 转换后的候选值有限性校验
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize("make", [lambda: MomentumSGD(1e40), lambda: Adam(1e40)])
+def test_dtype_cast_overflow_rejected_and_params_untouched(make):
+    # float32 参数 + float64 梯度 + lr=1e40：候选在 float64 下为 -1e40（有限），
+    # 写回 float32 会静默变成 -Inf。修复后必须在提交前拒绝。
+    params = {"w": np.array([0.0], dtype=np.float32)}
+    handle = params["w"]
+    with pytest.raises(ValueError, match="casting the candidate"):
+        make().step(params, {"w": np.array([1.0], dtype=np.float64)})
+    np.testing.assert_array_equal(params["w"], np.array([0.0], dtype=np.float32))
+    assert params["w"] is handle  # 对象身份不变
+
+
+@pytest.mark.parametrize("make", [lambda: MomentumSGD(1e40), lambda: Adam(1e40)])
+def test_state_not_advanced_after_cast_failure(make):
+    # 零梯度二次调用是行为学区分器：若失败调用曾偷偷提交状态
+    # （Momentum 速度=1.0 / Adam 矩 m=0.1、v=0.001、t=1），
+    # 本调用候选仍会是 ±9e39 量级并再次溢出被拒；只有状态未推进才会成功。
+    opt = make()
+    params = {"w": np.array([0.0], dtype=np.float32)}
+    handle = params["w"]
+    with pytest.raises(ValueError):
+        opt.step(params, {"w": np.array([1.0], dtype=np.float64)})
+    opt.step(params, {"w": np.array([0.0], dtype=np.float64)})  # 必须成功
+    np.testing.assert_array_equal(params["w"], np.array([0.0], dtype=np.float32))
+    assert params["w"] is handle
+    assert params["w"].dtype == np.float32
+    assert np.all(np.isfinite(params["w"]))
+
+
+@pytest.mark.parametrize(
+    "make, expected",
+    [
+        # Momentum: v_1 = 0.5 → theta = 1 - 0.05
+        (lambda: MomentumSGD(0.1), 1.0 - 0.1 * 0.5),
+        # Adam t=1: m_hat = 0.5, v_hat = 0.25 → theta = 1 - 0.1*0.5/(0.5+1e-8)
+        (lambda: Adam(0.1), 1.0 - 0.1 * 0.5 / (np.sqrt(0.25 * 0.001 / 0.001) + 1e-8)),
+    ],
+)
+def test_representable_float32_update_succeeds(make, expected):
+    # 可被 float32 表示的正常更新不得被转换检查误拒，且 dtype 保持 float32
+    params = {"w": np.array([1.0], dtype=np.float32)}
+    handle = params["w"]
+    make().step(params, {"w": np.array([0.5], dtype=np.float64)})
+    assert params["w"] is handle
+    assert params["w"].dtype == np.float32
+    assert np.all(np.isfinite(params["w"]))
+    np.testing.assert_allclose(params["w"], [expected], rtol=1e-6, atol=0)
+
+
+@pytest.mark.parametrize("make", [lambda: MomentumSGD(1e40), lambda: Adam(1e40)])
+def test_multi_param_atomicity_on_cast_overflow(make):
+    # "safe" 的候选可被 float32 表示（≈0 或 ≈-1e8），"over" 的候选溢出（≈-1e40）
+    # → 必须整体拒绝，两个参数都零写入
+    params = {
+        "safe": np.array([1.0], dtype=np.float32),
+        "over": np.array([0.0], dtype=np.float32),
+    }
+    handles = {key: params[key] for key in params}
+    grads = {
+        "safe": np.array([1e-40], dtype=np.float64),
+        "over": np.array([1.0], dtype=np.float64),
+    }
+    with pytest.raises(ValueError, match="casting the candidate"):
+        make().step(params, grads)
+    np.testing.assert_array_equal(params["safe"], np.array([1.0], dtype=np.float32))
+    np.testing.assert_array_equal(params["over"], np.array([0.0], dtype=np.float32))
+    assert params["safe"] is handles["safe"]
+    assert params["over"] is handles["over"]

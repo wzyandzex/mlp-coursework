@@ -224,7 +224,8 @@ class _StatefulOptimizer:
         raise NotImplementedError
 
     def step(self, params: dict, grads: dict) -> None:
-        """执行一步更新；先全量校验并计算候选，验证有限后统一提交（失败零写入）。"""
+        """执行一步更新；先全量校验并计算候选，验证有限（含写回目标 dtype
+        转换后的溢出检查）后统一提交（失败零写入）。"""
         if not isinstance(params, dict):
             raise TypeError(f"params must be a dict, got {type(params).__name__}.")
         if not isinstance(grads, dict):
@@ -246,9 +247,27 @@ class _StatefulOptimizer:
                         f"candidate optimizer state for {key!r} would contain non-finite "
                         f"values; refusing to update any parameter or state."
                     )
+        # 目标 dtype 转换验证：候选在计算 dtype 下有限，不代表能安全写回更窄的
+        # 参数 dtype（如 float64 候选 -1e40 写入 float32 参数会静默变成 -Inf）。
+        # 先对全部候选做目标 dtype 转换（显式管理浮点告警），再全部检查，最后
+        # 才统一提交——任何失败都不写入任何参数、状态或时间步。
+        casted: list[tuple[str, np.ndarray, np.ndarray]] = []
+        with np.errstate(over="ignore", invalid="ignore"):
+            for key, p, candidate in param_candidates:
+                if candidate.dtype == p.dtype:
+                    casted.append((key, p, candidate))
+                else:
+                    casted.append((key, p, candidate.astype(p.dtype)))
+        for key, p, cast in casted:
+            if not np.all(np.isfinite(cast)):
+                raise ValueError(
+                    f"update for {key!r} overflows after casting the candidate to the "
+                    f"target parameter dtype {p.dtype}; refusing to update any parameter "
+                    f"or state."
+                )
         # 统一提交：参数就地写回（对象身份不变），状态与时间步整体替换
-        for _key, p, candidate in param_candidates:
-            p[...] = candidate
+        for _key, p, cast in casted:
+            p[...] = cast
         self._state = new_state
         if new_timestep is not None:
             self._timestep = new_timestep

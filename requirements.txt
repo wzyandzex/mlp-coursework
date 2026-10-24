@@ -1,0 +1,4 @@
+# 当前阶段（P3-CORE-01）所需依赖：仅 NumPy 与 pytest
+# 不安装任何深度学习框架
+numpy>=1.26
+pytest>=7.4

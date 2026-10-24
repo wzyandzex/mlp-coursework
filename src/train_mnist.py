@@ -56,6 +56,16 @@ def _positive_float(text: str) -> float:
     return value
 
 
+def _non_negative_float(text: str) -> float:
+    try:
+        value = float(text)
+    except ValueError:
+        raise argparse.ArgumentTypeError(f"expected a number, got {text!r}") from None
+    if not math.isfinite(value) or value < 0.0:
+        raise argparse.ArgumentTypeError(f"must be a finite non-negative number, got {text!r}")
+    return value
+
+
 def _non_negative_int(text: str) -> int:
     try:
         value = int(text)
@@ -131,6 +141,38 @@ def build_parser() -> argparse.ArgumentParser:
         default=None,
         help="Optional run directory name under --output-dir; defaults to a timestamp.",
     )
+    parser.add_argument(
+        "--optimizer",
+        choices=("sgd", "momentum_sgd", "adam"),
+        default="sgd",
+        help="Optimizer for training (default: sgd).",
+    )
+    parser.add_argument(
+        "--lr-scheduler",
+        choices=("none", "step"),
+        default="none",
+        help="Learning-rate schedule: 'step' multiplies the lr by gamma every "
+        "step_size epochs (frozen: gamma=0.5, step_size=10; default: none).",
+    )
+    parser.add_argument(
+        "--early-stopping",
+        action="store_true",
+        help="Enable early stopping monitored on validation loss "
+        "(default: off; trains for all --epochs).",
+    )
+    parser.add_argument(
+        "--patience",
+        type=_positive_int,
+        default=5,
+        help="Early-stopping patience in epochs without sufficient improvement (default: 5).",
+    )
+    parser.add_argument(
+        "--min-delta",
+        type=_non_negative_float,
+        default=1e-4,
+        help="Absolute minimum val_loss improvement counted as early-stop improvement "
+        "(default: 1e-4). Does not affect raw-best checkpoint selection.",
+    )
     return parser
 
 
@@ -175,6 +217,17 @@ def main(argv=None) -> int:
             "batch_size": args.batch_size,
             "learning_rate": args.learning_rate,
             "eval_batch_size": 1000,
+            "optimizer": args.optimizer,
+            "momentum": 0.9,
+            "beta1": 0.9,
+            "beta2": 0.999,
+            "eps": 1e-8,
+            "lr_scheduler": args.lr_scheduler,
+            "step_size": 10,
+            "gamma": 0.5,
+            "early_stopping": args.early_stopping,
+            "patience": args.patience,
+            "min_delta": args.min_delta,
         },
         "seeds": {"model_seed": args.seed, "split_seed": args.split_seed},
         "data": {

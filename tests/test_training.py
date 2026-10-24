@@ -94,6 +94,7 @@ from src.training import (  # noqa: E402
     save_checkpoint,
     select_best_epoch,
     train_model,
+    write_history_csv,
 )
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
@@ -474,4 +475,424 @@ def test_cli_rejects_invalid_epochs_and_batch_size():
     assert _run_cli(["--epochs", "0"]).returncode != 0
     assert _run_cli(["--batch-size", "-4"]).returncode != 0
     assert _run_cli(["--seed", "-1"]).returncode != 0
+
+
+# ---------------------------------------------------------------------------
+# P5.2-B 新增：学习率调度、早停、raw-best 分离与优化器注入
+# 全部使用合成数据与脚本化验证指标，不依赖 MNIST。
+# ---------------------------------------------------------------------------
+
+import src.training as training_module  # noqa: E402
+from src.optimizers import Adam, MomentumSGD  # noqa: E402
+
+
+def _scripted_validation(monkeypatch, losses):
+    """把 training.evaluate 替换为按调用次序返回脚本化验证指标的桩。
+
+    第 i 次调用返回 (losses[i], 0.9)；耗尽脚本后重复最后一个值。
+    返回调用计数器供断言使用。
+    """
+    state = {"call": 0}
+
+    def stub(model, X, y, batch_size=1000):
+        index = min(state["call"], len(losses) - 1)
+        state["call"] += 1
+        return losses[index], 0.9
+
+    monkeypatch.setattr(training_module, "evaluate", stub)
+    return state
+
+
+def _early_stop_run(monkeypatch, losses, epochs, patience=5, min_delta=1e-4, early_stopping=True):
+    X, y, tr, va, _te = _tiny_split()
+    model = MLP(2, [8], 3, hidden_activation="tanh", seed=0)
+    _scripted_validation(monkeypatch, losses)
+    return train_model(
+        model, X[tr], y[tr], X[va], y[va],
+        epochs=epochs, batch_size=32, learning_rate=0.1, seed=0,
+        early_stopping=early_stopping, patience=patience, min_delta=min_delta,
+    )
+
+
+# ---------- 学习率调度 ----------
+
+
+def test_history_lr_without_scheduler_is_constant():
+    # lr_scheduler 缺省（none）：所有 epoch 使用初始 lr，行为与 P4 一致
+    X, y, tr, va, _te = _tiny_split()
+    model = MLP(2, [8], 3, hidden_activation="tanh", seed=0)
+    result = train_model(
+        model, X[tr], y[tr], X[va], y[va],
+        epochs=3, batch_size=32, learning_rate=0.25, seed=0,
+    )
+    assert [row["lr"] for row in result.history] == [0.25, 0.25, 0.25]
+    assert all(np.isfinite(row["lr"]) for row in result.history)
+
+
+def test_step_decay_schedule_boundaries():
+    # 冻结公式 lr(epoch) = base * gamma^((epoch-1)//step_size)：
+    # 21 个 epoch → [base]*10 + [base/2]*10 + [base/4]，epoch 10 不提前衰减
+    X, y, tr, va, _te = _tiny_split()
+    model = MLP(2, [8], 3, hidden_activation="tanh", seed=0)
+    result = train_model(
+        model, X[tr], y[tr], X[va], y[va],
+        epochs=21, batch_size=32, learning_rate=0.1, seed=0,
+        lr_scheduler="step", step_size=10, gamma=0.5,
+    )
+    expected = [0.1] * 10 + [0.05] * 10 + [0.025]
+    assert [row["lr"] for row in result.history] == expected
+    assert result.history[9]["lr"] == 0.1   # epoch 10 仍是 base lr
+    assert result.history[10]["lr"] == 0.05  # epoch 11 才首次衰减
+    assert result.history[20]["lr"] == 0.025
+    assert result.stop_reason == "max_epochs"
+
+
+def test_injected_optimizer_instance_is_reused_and_scheduled():
+    # 注入的同一 optimizer 实例被调度器驱动：step_size=2 时 epoch 1–2 用 base、
+    # 3–4 用 gamma 倍、5 用 gamma² 倍；实例 learning_rate 终值与最后 epoch 一致
+    # （证明未重建实例）
+    X, y, tr, va, _te = _tiny_split()
+    model = MLP(2, [8], 3, hidden_activation="tanh", seed=0)
+    opt = MomentumSGD(0.2, momentum=0.9)
+    result = train_model(
+        model, X[tr], y[tr], X[va], y[va],
+        epochs=5, batch_size=32, seed=0,
+        optimizer=opt, lr_scheduler="step", step_size=2, gamma=0.5,
+    )
+    assert [row["lr"] for row in result.history] == [0.2, 0.2, 0.1, 0.1, 0.05]
+    assert opt.learning_rate == pytest.approx(0.05)
+    assert result.stop_reason == "max_epochs"
+
+
+def test_optimizer_and_learning_rate_are_mutually_exclusive():
+    X, y, tr, va, _te = _tiny_split()
+    model = MLP(2, [8], 3, seed=0)
+    with pytest.raises(ValueError, match="not both"):
+        train_model(
+            model, X[tr], y[tr], X[va], y[va],
+            epochs=1, batch_size=32, learning_rate=0.1, seed=0,
+            optimizer=MomentumSGD(0.1),
+        )
+    with pytest.raises(ValueError, match="either optimizer or learning_rate"):
+        train_model(model, X[tr], y[tr], X[va], y[va], epochs=1, batch_size=32, seed=0)
+    with pytest.raises(TypeError, match="optimizer must be"):
+        train_model(
+            model, X[tr], y[tr], X[va], y[va],
+            epochs=1, batch_size=32, seed=0, optimizer="sgd",
+        )
+
+
+@pytest.mark.parametrize(
+    "kwargs, expected_exception",
+    [
+        ({"lr_scheduler": "cosine"}, ValueError),
+        ({"lr_scheduler": "step", "step_size": 0}, ValueError),
+        ({"lr_scheduler": "step", "step_size": -10}, ValueError),
+        ({"lr_scheduler": "step", "step_size": True}, ValueError),
+        ({"lr_scheduler": "step", "step_size": 2.5}, ValueError),
+        ({"lr_scheduler": "step", "gamma": 0.0}, ValueError),
+        ({"lr_scheduler": "step", "gamma": -0.5}, ValueError),
+        ({"lr_scheduler": "step", "gamma": 1.5}, ValueError),
+        ({"lr_scheduler": "step", "gamma": float("nan")}, ValueError),
+        ({"lr_scheduler": "step", "gamma": float("inf")}, ValueError),
+        ({"lr_scheduler": "step", "gamma": True}, TypeError),
+    ],
+)
+def test_invalid_scheduler_arguments_rejected(kwargs, expected_exception):
+    X, y, tr, va, _te = _tiny_split()
+    model = MLP(2, [8], 3, seed=0)
+    with pytest.raises(expected_exception):
+        train_model(
+            model, X[tr], y[tr], X[va], y[va],
+            epochs=1, batch_size=32, learning_rate=0.1, seed=0, **kwargs,
+        )
+
+
+# ---------- 早停语义（脚本化验证损失序列） ----------
+
+
+def test_early_stopping_disabled_runs_all_epochs(monkeypatch):
+    result = _early_stop_run(monkeypatch, [0.5, 0.4, 0.3, 0.3], epochs=4, early_stopping=False)
+    assert len(result.history) == 4
+    assert result.stop_reason == "max_epochs"
+
+
+def test_early_stopping_stops_at_patience_without_extra_epoch(monkeypatch):
+    # [1.0]*6，patience=2：ep1 初始化 reference；ep2/ep3 连续不改善 → ep3 停止
+    result = _early_stop_run(monkeypatch, [1.0] * 6, epochs=6, patience=2)
+    assert len(result.history) == 3
+    assert result.stop_reason == "early_stopping"
+    assert result.best_epoch == 1
+    assert result.history[-1]["epoch"] == 3  # 停止 epoch 计入 history，无额外一轮
+
+
+def test_min_delta_boundary_counts_as_improvement(monkeypatch):
+    # val_loss == reference - min_delta 属于"足够大的改善"（<= 语义）→ 重置计数
+    result = _early_stop_run(
+        monkeypatch, [1.0, 0.9999, 0.9999], epochs=3, patience=2, min_delta=1e-4
+    )
+    assert len(result.history) == 3
+    assert result.stop_reason == "max_epochs"
+
+
+def test_small_improvement_updates_raw_best_but_not_patience(monkeypatch):
+    # [1.0, 0.995, 0.988, 0.988]，min_delta=0.01，patience=2：
+    # ep2: 0.995 < 1.0 → raw-best 更新（best_epoch=2），但 0.995 > 0.99 → bad=1；
+    # ep3: 0.988 <= 1.0-0.01 → 改善（若错误地在 ep2 更新 reference，这里就会停止）；
+    # ep4: 0.988 <= 0.988-0.01? 否 → bad=1 < 2 → 跑满 4 个 epoch
+    result = _early_stop_run(
+        monkeypatch, [1.0, 0.995, 0.988, 0.988], epochs=4, patience=2, min_delta=0.01
+    )
+    assert len(result.history) == 4
+    assert result.stop_reason == "max_epochs"
+    assert result.best_epoch == 3
+    assert result.best_val_loss == pytest.approx(0.988)
+
+
+def test_patience_exhaustion_keeps_small_improvement_as_best(monkeypatch):
+    # [1.0, 0.995, 0.996, 0.997]，min_delta=0.01，patience=2：
+    # ep2 raw-best=0.995 但 bad=1；ep3 bad=2 → 停止；best_epoch 指向轻微改善 epoch
+    result = _early_stop_run(
+        monkeypatch, [1.0, 0.995, 0.996, 0.997], epochs=6, patience=2, min_delta=0.01
+    )
+    assert len(result.history) == 3
+    assert result.stop_reason == "early_stopping"
+    assert result.best_epoch == 2
+    assert result.best_val_loss == pytest.approx(0.995)
+
+
+def test_real_improvement_resets_patience(monkeypatch):
+    # [1.0, 0.9, 0.9, 0.9]，min_delta=0.05，patience=2：
+    # ep2: 0.9 <= 0.95 → 改善并重置；ep3 bad=1；ep4 bad=2 → 停止于 ep4
+    # （若无重置语义，ep3 就会停止）
+    result = _early_stop_run(
+        monkeypatch, [1.0, 0.9, 0.9, 0.9], epochs=6, patience=2, min_delta=0.05
+    )
+    assert len(result.history) == 4
+    assert result.stop_reason == "early_stopping"
+
+
+def test_min_delta_zero_treats_equal_loss_as_improvement(monkeypatch):
+    # min_delta=0（合法下界）：val_loss == reference 即改善，连续平局不早停
+    result = _early_stop_run(monkeypatch, [1.0, 1.0, 1.0], epochs=3, patience=2, min_delta=0.0)
+    assert len(result.history) == 3
+    assert result.stop_reason == "max_epochs"
+
+
+@pytest.mark.parametrize(
+    "losses",
+    [[1.0, float("nan")], [1.0, float("inf")], [1.0, -float("inf")]],
+)
+def test_non_finite_validation_loss_fails_fast(monkeypatch, losses):
+    # 非有限验证指标必须快速失败（带 epoch 上下文），不得当作普通 bad epoch
+    X, y, tr, va, _te = _tiny_split()
+    model = MLP(2, [8], 3, hidden_activation="tanh", seed=0)
+    _scripted_validation(monkeypatch, losses)
+    with pytest.raises(RuntimeError, match="epoch 2"):
+        train_model(
+            model, X[tr], y[tr], X[va], y[va],
+            epochs=3, batch_size=32, learning_rate=0.1, seed=0, early_stopping=True,
+        )
+
+
+@pytest.mark.parametrize(
+    "kwargs, expected_exception",
+    [
+        ({"patience": 0}, ValueError),
+        ({"patience": -1}, ValueError),
+        ({"patience": True}, ValueError),
+        ({"patience": 2.5}, ValueError),
+        ({"patience": "5"}, ValueError),
+        ({"min_delta": -1e-4}, ValueError),
+        ({"min_delta": float("nan")}, ValueError),
+        ({"min_delta": float("inf")}, ValueError),
+        ({"min_delta": True}, TypeError),
+        ({"min_delta": "1e-4"}, TypeError),
+        ({"min_delta": None}, TypeError),
+        ({"early_stopping": 1}, TypeError),
+    ],
+)
+def test_invalid_early_stopping_arguments_rejected(kwargs, expected_exception):
+    X, y, tr, va, _te = _tiny_split()
+    model = MLP(2, [8], 3, seed=0)
+    with pytest.raises(expected_exception):
+        train_model(
+            model, X[tr], y[tr], X[va], y[va],
+            epochs=1, batch_size=32, learning_rate=0.1, seed=0,
+            early_stopping=True, **kwargs,
+        )
+
+
+# ---------- 早停下的 checkpoint 与产物一致性 ----------
+
+
+def test_early_stop_artifacts_consistent_with_raw_best(monkeypatch, tmp_path):
+    # [1.0, 0.995, 0.996]，patience=2 → 停止于 ep3，但 raw-best 是 ep2；
+    # run_experiment 保存的 checkpoint、summary 最佳指标与测试评估前恢复的
+    # 参数必须全部指向 ep2（沿用 P4 一致性回归的证明方式）
+    from src.training import load_checkpoint
+
+    real_evaluate = training_module.evaluate
+    X, y, tr, va, te = _tiny_split()
+    test_images = X[te]
+    captured = {}
+    val_sequence = iter([1.0, 0.995, 0.996])
+
+    def stub(model, X_eval, y_eval, batch_size=1000):
+        if X_eval is test_images:  # 测试集评估：走真实计算并捕获恢复后的参数
+            loss, acc = real_evaluate(model, X_eval, y_eval, batch_size=batch_size)
+            captured["params"] = model.get_params_copy()
+            return loss, acc
+        return next(val_sequence, 0.996), 0.9  # 验证评估：脚本化 val_loss
+
+    monkeypatch.setattr(training_module, "evaluate", stub)
+    config = _tiny_config(learning_rate=0.1)
+    config["network"]["hidden_activation"] = "tanh"
+    config["training"]["epochs"] = 6
+    config["training"]["early_stopping"] = True
+    config["training"]["patience"] = 2
+    config["training"]["min_delta"] = 0.01
+    summary = run_experiment(
+        train_images=X[tr], train_labels=y[tr],
+        val_images=X[va], val_labels=y[va],
+        test_images=test_images, test_labels=y[te],
+        config=config, output_root=tmp_path, run_name="early_stop_run",
+    )
+
+    assert summary["stop_reason"] == "early_stopping"
+    assert summary["best_epoch"] == 2
+    assert summary["best_validation_loss"] == pytest.approx(0.995)
+    assert summary["epochs_completed"] == 3
+
+    run_dir = tmp_path / "early_stop_run"
+    reference = MLP(2, [8], 3, hidden_activation="tanh", seed=0).params
+    best_params = load_checkpoint(run_dir / "best_model.npz", reference)
+    for key in best_params:  # 测试评估前恢复的参数 == checkpoint（raw-best）
+        np.testing.assert_array_equal(best_params[key], captured["params"][key])
+    eval_model = MLP(2, [8], 3, hidden_activation="tanh", seed=999)
+    eval_model.set_params(best_params)
+    loss, acc = real_evaluate(eval_model, test_images, y[te])
+    assert loss == pytest.approx(summary["test_loss"])
+    assert acc == pytest.approx(summary["test_accuracy"])
+
+
+def test_history_csv_columns_and_lr_values(tmp_path):
+    # history.csv 保留全部旧列且 lr 在末尾；每行 lr 有限并与训练实际使用值一致
+    X, y, tr, va, _te = _tiny_split()
+    model = MLP(2, [8], 3, hidden_activation="tanh", seed=0)
+    result = train_model(
+        model, X[tr], y[tr], X[va], y[va],
+        epochs=5, batch_size=32, learning_rate=0.2, seed=0,
+        lr_scheduler="step", step_size=2, gamma=0.5,
+    )
+    write_history_csv(result.history, tmp_path / "history.csv")
+    with open(tmp_path / "history.csv", newline="", encoding="utf-8") as handle:
+        rows = list(csv.DictReader(handle))
+    assert list(rows[0].keys()) == list(HISTORY_FIELDS)
+    assert list(rows[0].keys())[-1] == "lr"
+    assert [float(row["lr"]) for row in rows] == [0.2, 0.2, 0.1, 0.1, 0.05]
+
+
+# ---------- 优化器选择与 config 兼容 ----------
+
+
+def test_run_experiment_defaults_to_sgd_without_optimizer_key(monkeypatch, tmp_path):
+    created = []
+
+    class CountingSGD(training_module.SGD):
+        def __init__(self, *args, **kwargs):
+            created.append(self)
+            super().__init__(*args, **kwargs)
+
+    monkeypatch.setattr(training_module, "SGD", CountingSGD)
+    X, y, tr, va, te = _tiny_split()
+    summary = run_experiment(
+        train_images=X[tr], train_labels=y[tr],
+        val_images=X[va], val_labels=y[va],
+        test_images=X[te], test_labels=y[te],
+        config=_tiny_config(),  # 旧式 config：无 optimizer/调度/早停键
+        output_root=tmp_path, run_name="sgd_default",
+    )
+    assert len(created) == 1  # 旧 config 默认 SGD
+    assert summary["stop_reason"] == "max_epochs"
+    with open(tmp_path / "sgd_default" / "config.json", encoding="utf-8") as handle:
+        saved = json.load(handle)
+    assert saved["training"]["optimizer"] == "sgd"
+    assert saved["training"]["lr_scheduler"] == "none"
+    assert saved["training"]["early_stopping"] is False
+    assert saved["training"]["patience"] == 5
+    assert saved["training"]["min_delta"] == 1e-4
+    assert saved["training"]["step_size"] == 10
+    assert saved["training"]["gamma"] == 0.5
+
+
+@pytest.mark.parametrize(
+    "optimizer_name, attr_name, optimizer_cls",
+    [("momentum_sgd", "MomentumSGD", MomentumSGD), ("adam", "Adam", Adam)],
+)
+def test_run_experiment_instantiates_selected_optimizer_once(
+    monkeypatch, tmp_path, optimizer_name, attr_name, optimizer_cls
+):
+    created = []
+
+    class Counting(optimizer_cls):
+        def __init__(self, *args, **kwargs):
+            created.append(self)
+            super().__init__(*args, **kwargs)
+
+    monkeypatch.setattr(training_module, attr_name, Counting)
+    X, y, tr, va, te = _tiny_split()
+    config = _tiny_config()
+    config["training"]["optimizer"] = optimizer_name
+    config["training"]["epochs"] = 3
+    summary = run_experiment(
+        train_images=X[tr], train_labels=y[tr],
+        val_images=X[va], val_labels=y[va],
+        test_images=X[te], test_labels=y[te],
+        config=config, output_root=tmp_path, run_name=f"run_{optimizer_name}",
+    )
+    assert len(created) == 1  # 每 run 恰好实例化一次，不跨 epoch 重建
+    assert isinstance(created[0], optimizer_cls)
+    assert summary["epochs_completed"] == 3
+    with open(tmp_path / f"run_{optimizer_name}" / "config.json", encoding="utf-8") as handle:
+        saved = json.load(handle)
+    assert saved["training"]["optimizer"] == optimizer_name
+    if optimizer_name == "momentum_sgd":
+        assert saved["training"]["momentum"] == 0.9
+    else:
+        assert saved["training"]["beta1"] == 0.9
+        assert saved["training"]["beta2"] == 0.999
+        assert saved["training"]["eps"] == 1e-8
+
+
+def test_caller_config_not_mutated_by_run_experiment(tmp_path):
+    X, y, tr, va, te = _tiny_split()
+    config = _tiny_config()
+    before = json.loads(json.dumps(config))
+    run_experiment(
+        train_images=X[tr], train_labels=y[tr],
+        val_images=X[va], val_labels=y[va],
+        test_images=X[te], test_labels=y[te],
+        config=config, output_root=tmp_path, run_name="no_mutation",
+    )
+    assert config == before  # 调用方原始 config 不被写入默认键
+
+
+# ---------- CLI ----------
+
+
+def test_cli_help_shows_new_training_control_options():
+    proc = _run_cli(["--help"])
+    assert proc.returncode == 0
+    for flag in ("--optimizer", "--lr-scheduler", "--early-stopping", "--patience", "--min-delta"):
+        assert flag in proc.stdout
+    assert "sgd" in proc.stdout  # 默认优化器
+
+
+def test_cli_rejects_invalid_new_options():
+    assert _run_cli(["--optimizer", "adagrad"]).returncode != 0
+    assert _run_cli(["--lr-scheduler", "cosine"]).returncode != 0
+    assert _run_cli(["--patience", "0"]).returncode != 0
+    assert _run_cli(["--min-delta", "-0.5"]).returncode != 0
+    assert _run_cli(["--min-delta", "nan"]).returncode != 0
 

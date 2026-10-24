@@ -62,7 +62,7 @@ null、类型错误或越界数值都会写入**定位到字段**的诊断并判
 | `network` | 对象：`input_dim`/`output_dim` 为正整数；`hidden_dims` 为非空正整数列表；`hidden_activation` ∈ {relu, sigmoid, tanh}；`initializer` ∈ {auto, he_normal, xavier_normal} |
 | `training` | 对象：`epochs`/`batch_size`/`eval_batch_size`/`step_size`/`patience` 为正整数；`learning_rate`/`eps` 为 >0 的有限数；`momentum`/`beta1`/`beta2` ∈ [0, 1)；`gamma` ∈ (0, 1]；`min_delta`/`l2_lambda` ≥ 0；`optimizer` ∈ {sgd, momentum_sgd, adam}；`lr_scheduler` ∈ {none, step}；`early_stopping` 为 JSON boolean |
 | `seeds` | 对象：`model_seed`/`split_seed` 为非负整数 |
-| `data` | 对象：`source_dir`/`split_strategy` 为非空字符串；`train_size`/`val_size` 为正整数；`sample_counts` 为含非负整数 `train`/`validation`/`test` 的对象 |
+| `data` | 对象：`source_dir`/`split_strategy` 为非空字符串；`train_size`/`val_size` 为正整数；`sample_counts` 为含非负整数 `train`/`validation`/`test` 的对象（**该键整体缺失同样判 invalid**，键存在但为 null/非对象亦然） |
 | `environment` | 对象：`python`/`numpy`/`platform` 为非空字符串 |
 | `experiment_role` | ∈ {baseline, exploration, final} |
 | `evaluate_test` | 必须是真正的 JSON boolean（0/1/字符串不算），且与角色匹配 |

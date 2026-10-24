@@ -366,11 +366,20 @@ def _validate_config_schema(config: dict, diagnostics: list) -> bool:
         ok = _require_int(data, "val_size", "data", diagnostics, minimum=1) is not None and ok
         ok = _require_string(data, "split_strategy", "data", diagnostics) is not None and ok
         sample_counts = data.get("sample_counts")
-        if isinstance(sample_counts, dict):
+        if "sample_counts" not in data:
+            # R2：sample_counts 是必需键——整体缺失必须判 invalid。不得静默补
+            # 默认值、不得把缺失当成 0、也不得从 summary.sample_counts 反向填充
+            diagnostics.append(
+                "data missing required field 'sample_counts' (must be an object with "
+                "non-negative integer train/validation/test counts)"
+            )
+            ok = False
+        elif isinstance(sample_counts, dict):
             for name in ("train", "validation", "test"):
                 ok = _require_int(sample_counts, name, "data.sample_counts",
                                   diagnostics, minimum=0) is not None and ok
-        elif "sample_counts" in data:
+        else:
+            # 键存在但为 null/列表/字符串等非对象类型
             diagnostics.append(
                 f"data.sample_counts must be an object with non-negative integer "
                 f"train/validation/test counts, got {sample_counts!r}"

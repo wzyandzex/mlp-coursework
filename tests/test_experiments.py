@@ -446,6 +446,66 @@ def test_sample_counts_mismatch_marked_invalid(tmp_path):
                for diagnostic in runs["mismatch"]["diagnostics"])
 
 
+# ---------------------------------------------------------------------------
+# P5.2-D-R2 整改：config.data.sample_counts 必需键校验
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    "sample_counts, missing_inner_key",
+    [
+        ("missing", None),                                 # 键整体缺失（R2 缺陷场景）
+        (None, None),                                      # 显式 null
+        ({"train": 20000, "validation": 5000}, "test"),    # 缺 test
+        ({"train": 20000, "test": 10000}, "validation"),   # 缺 validation
+        ({"validation": 5000, "test": 10000}, "train"),    # 缺 train
+    ],
+)
+def test_missing_or_malformed_sample_counts_marked_invalid(
+    tmp_path, sample_counts, missing_inner_key
+):
+    root = tmp_path / "outputs"
+    config = _make_config()
+    if sample_counts == "missing":
+        del config["data"]["sample_counts"]  # 键整体缺失：旧实现会静默判 success
+    else:
+        config["data"]["sample_counts"] = sample_counts
+    _write_run(root, "bad_counts", config=config, summary=_make_summary())
+    report = aggregate(root=root, output=root / "_aggregate")
+    runs = {record["run_name"]: record
+            for record in _read_json(root / "_aggregate" / "runs.json")["runs"]}
+    assert runs["bad_counts"]["status"] == "invalid"
+    assert any("sample_counts" in diagnostic
+               for diagnostic in runs["bad_counts"]["diagnostics"])
+    if missing_inner_key is not None:  # 内层键缺失时诊断定位到具体字段
+        assert any(
+            missing_inner_key in diagnostic and "missing required field" in diagnostic
+            for diagnostic in runs["bad_counts"]["diagnostics"]
+        )
+    # invalid run 不得进入成功分组
+    assert report["counts"]["success"] == 0
+    assert report["counts"]["invalid"] == 1
+    assert _read_json(root / "_aggregate" / "groups.json")["groups"] == []
+
+
+def test_missing_sample_counts_default_mode_and_strict(tmp_path):
+    # 默认模式：保留完整汇总与诊断、退出码 0；--strict：非零退出码
+    root = tmp_path / "outputs"
+    config = _make_config()
+    del config["data"]["sample_counts"]
+    _write_run(root, "no_counts", config=config, summary=_make_summary())
+    report = aggregate(root=root, output=root / "_aggregate")
+    assert report["counts"]["invalid"] == 1
+    assert (root / "_aggregate" / "runs.json").is_file()
+    assert (root / "_aggregate" / "groups.json").is_file()
+    assert (root / "_aggregate" / "report.json").is_file()
+    problems = report["problems"]
+    assert len(problems) == 1 and problems[0]["run_path"] == "no_counts"
+    assert any("sample_counts" in diagnostic for diagnostic in problems[0]["diagnostics"])
+    assert main(["aggregate", "--root", str(root), "--output", str(root / "_aggregate"),
+                 "--overwrite", "--strict"]) == 1
+
+
 def test_extreme_integer_values_do_not_crash_aggregation(tmp_path):
     # 极大整数（10**400）曾让 math.isfinite 抛未捕获 OverflowError 导致整个
     # 汇总中止；修复后必须可靠标记 invalid，输出仍是可严格解析的标准 JSON

@@ -114,15 +114,19 @@ python -m src.train_mnist --epochs 5 --learning-rate 0.2 --run-name quick_check
   解析校验通过（60000/10000 张 28×28 图）。
 * 学习率冒烟：0.05 / 0.1 / 0.3 × 3 epoch（结果见上表）。
 * 正式基线：`python -m src.train_mnist`（30 epoch，lr 0.1，batch 128，seed 42/2026），
-  运行目录 `outputs/mnist_baseline/run_20261024_172410`，总耗时约 15.6 s：
+  运行目录 `outputs/mnist_baseline/baseline_30ep_consistency_fix`，总耗时约 16 s：
 
 | 指标 | 数值 |
 | --- | --- |
 | 最佳 epoch | 29 |
 | 最佳验证 loss / accuracy | 0.1254 / 0.9576 |
-| 测试 loss / accuracy | 0.1260 / **0.9621** |
+| 测试 loss / accuracy | 0.1210 / **0.9627** |
 
-* 可复现性：两次独立完整运行的指标完全一致（best epoch 29、val_loss 0.1254、test 0.9621）。
+* 一致性说明：测试集评估在恢复最佳 epoch 参数（`set_params(best_params)`）后进行，
+  summary 中的测试指标与 `best_model.npz` 保存的参数严格对应（独立重算逐位一致）。
+* 可复现性：多次独立完整运行的训练轨迹与验证指标完全一致
+  （best epoch 29、val_loss 0.1254）；整改前旧实现曾用最后 epoch 模型报告测试指标
+  （当时为 0.1260/0.9621），该不一致已由回归测试修复并锁定。
 
 **尚未执行（属后续阶段，不在本阶段授权内）**：多层网络/不同激活/不同优化器等扩展实验、
 Momentum/Adam、学习率调度、早停、正则化、ROC/AUC、最终课程报告。

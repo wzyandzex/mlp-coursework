@@ -379,6 +379,69 @@ def _run_cli(args):
     )
 
 
+def test_summary_test_metrics_correspond_to_best_checkpoint(tmp_path, monkeypatch):
+    """复审整改回归：summary 的测试指标必须来自 best_model.npz 保存的最佳参数。
+
+    场景刻意让最后一个 epoch 发散（val_loss 约 2.08，最佳 epoch 约 0.006），
+    两组参数天差地别：旧实现用“最后 epoch 的 model”评估测试集，本测试在旧
+    实现下必然失败；修复后（测试集评估前恢复最佳参数）必须通过。
+    """
+    from src import training as training_module
+
+    # 确定性场景：噪声 0.9 的三簇数据 + tanh + lr 2.0，最佳 epoch 在中段出现
+    X, y = _make_three_clusters(n_per_class=40, noise=0.9, seed=0)
+    perm = np.random.default_rng(1).permutation(len(y))
+    tr, va, te = perm[:80], perm[80:100], perm[100:]
+    test_images, test_labels = X[te], y[te]
+
+    config = _tiny_config(learning_rate=2.0)
+    config["network"]["hidden_dims"] = [16]
+    config["network"]["hidden_activation"] = "tanh"
+    config["seeds"]["model_seed"] = 7
+    config["training"]["epochs"] = 8
+    config["training"]["batch_size"] = 8
+    config["training"]["eval_batch_size"] = 16
+
+    captured = {}
+    real_evaluate = training_module.evaluate
+
+    def spy(model, X_eval, y_eval, batch_size=1000):
+        loss, acc = real_evaluate(model, X_eval, y_eval, batch_size=batch_size)
+        if X_eval is test_images:  # 只捕获对测试集的那一次评估
+            captured["calls"] = captured.get("calls", 0) + 1
+            captured["params"] = model.get_params_copy()
+            captured["metrics"] = (loss, acc)
+        return loss, acc
+
+    monkeypatch.setattr(training_module, "evaluate", spy)
+    summary = run_experiment(
+        train_images=X[tr], train_labels=y[tr],
+        val_images=X[va], val_labels=y[va],
+        test_images=test_images, test_labels=test_labels,
+        config=config, output_root=tmp_path, run_name="consistency_run",
+    )
+
+    run_dir = tmp_path / "consistency_run"
+    # 场景守卫：最佳 epoch 不是最后一个 epoch，否则本测试无法区分两组参数
+    assert summary["best_epoch"] < config["training"]["epochs"]
+    # 测试集只被评估一次，summary 的测试指标就来自这一次
+    assert captured["calls"] == 1
+    assert captured["metrics"] == (summary["test_loss"], summary["test_accuracy"])
+
+    # 评估测试集时模型里的参数 == best_model.npz 里的最佳参数（旧实现此处必然不等）
+    reference = MLP(2, [16], 3, hidden_activation="tanh", seed=0).params
+    best_params = load_checkpoint(run_dir / "best_model.npz", reference)
+    for key in best_params:
+        np.testing.assert_array_equal(best_params[key], captured["params"][key])
+
+    # 独立重算：加载 checkpoint 后对测试集评估，结果必须与 summary 一致
+    eval_model = MLP(2, [16], 3, hidden_activation="tanh", seed=999)
+    eval_model.set_params(best_params)
+    loss, acc = evaluate(eval_model, test_images, test_labels)
+    assert loss == pytest.approx(summary["test_loss"], rel=1e-12, abs=1e-15)
+    assert acc == pytest.approx(summary["test_accuracy"], abs=1e-12)
+
+
 def test_cli_help_shows_usage_and_defaults():
     proc = _run_cli(["--help"])
     assert proc.returncode == 0

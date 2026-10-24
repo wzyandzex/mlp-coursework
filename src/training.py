@@ -345,7 +345,10 @@ def run_experiment(
         verbose=verbose,
     )
 
-    # 测试集只在训练与验证集选型全部完成后评估这一次
+    # 测试集只在训练与验证集选型全部完成后评估这一次。
+    # model 训练结束时处于最后一个 epoch；必须先恢复到最佳 epoch 的参数，
+    # 保证 summary 中的测试指标与 best_model.npz 保存的是同一组参数。
+    model.set_params(result.best_params)
     test_loss, test_accuracy = evaluate(model, test_images, test_labels)
 
     write_history_csv(result.history, run_dir / "history.csv")

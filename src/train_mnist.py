@@ -173,6 +173,29 @@ def build_parser() -> argparse.ArgumentParser:
         help="Absolute minimum val_loss improvement counted as early-stop improvement "
         "(default: 1e-4). Does not affect raw-best checkpoint selection.",
     )
+    parser.add_argument(
+        "--l2-lambda",
+        type=_non_negative_float,
+        default=0.0,
+        help="L2 regularization coefficient on weight matrices only "
+        "(J_obj = J_data + lambda/2 * sum(||W||^2); default: 0.0 = off).",
+    )
+    parser.add_argument(
+        "--no-test-evaluation",
+        action="store_true",
+        help="Skip test-set evaluation entirely (validation-only exploration run): "
+        "summary records test_evaluation='not_run' and null test metrics. "
+        "Default: off (test set evaluated once after model selection, P4 behavior).",
+    )
+    parser.add_argument(
+        "--experiment-role",
+        choices=("baseline", "exploration", "final"),
+        default=None,
+        help="Run role recorded in config/summary. Default: derived from the evaluation "
+        "strategy (baseline when the test set is evaluated, exploration otherwise). "
+        "'final' must only be used after the complete experiment configuration is "
+        "frozen; it requires test evaluation.",
+    )
     return parser
 
 
@@ -228,6 +251,7 @@ def main(argv=None) -> int:
             "early_stopping": args.early_stopping,
             "patience": args.patience,
             "min_delta": args.min_delta,
+            "l2_lambda": args.l2_lambda,
         },
         "seeds": {"model_seed": args.seed, "split_seed": args.split_seed},
         "data": {
@@ -250,18 +274,23 @@ def main(argv=None) -> int:
             val_labels=split.val_labels,
             test_images=split.test_images,
             test_labels=split.test_labels,
-            config=config,
-            output_root=args.output_dir,
-            run_name=args.run_name,
-            verbose=True,
-        )
+        config=config,
+        output_root=args.output_dir,
+        run_name=args.run_name,
+        verbose=True,
+        evaluate_test=not args.no_test_evaluation,
+        experiment_role=args.experiment_role,
+    )
     except (TypeError, ValueError, RuntimeError) as exc:
         print(f"error: {exc}", file=sys.stderr)
         return 1
 
     print(f"[best] epoch {summary['best_epoch']} val_loss={summary['best_validation_loss']:.4f} "
           f"val_acc={summary['best_validation_accuracy']:.4f}")
-    print(f"[test] loss={summary['test_loss']:.4f} accuracy={summary['test_accuracy']:.4f}")
+    if summary["test_evaluation"] == "executed":
+        print(f"[test] loss={summary['test_loss']:.4f} accuracy={summary['test_accuracy']:.4f}")
+    else:
+        print("[test] not evaluated (validation-only run; test metrics are null in summary)")
     print(f"[artifacts] {summary['run_dir']}")
     return 0
 

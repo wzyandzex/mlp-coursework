@@ -87,8 +87,10 @@ from pathlib import Path  # noqa: E402
 from src.training import (  # noqa: E402
     HISTORY_FIELDS,
     _iterate_minibatches,
+    add_l2_gradient,
     create_run_directory,
     evaluate,
+    l2_penalty,
     load_checkpoint,
     run_experiment,
     save_checkpoint,
@@ -788,9 +790,12 @@ def test_history_csv_columns_and_lr_values(tmp_path):
     write_history_csv(result.history, tmp_path / "history.csv")
     with open(tmp_path / "history.csv", newline="", encoding="utf-8") as handle:
         rows = list(csv.DictReader(handle))
-    assert list(rows[0].keys()) == list(HISTORY_FIELDS)
-    assert list(rows[0].keys())[-1] == "lr"
+    assert list(rows[0].keys()) == list(HISTORY_FIELDS)  # 旧列顺序保持，新列只追加
+    assert list(rows[0].keys())[-1] == "train_objective_loss"
+    assert list(rows[0].keys())[-2] == "lr"
     assert [float(row["lr"]) for row in rows] == [0.2, 0.2, 0.1, 0.1, 0.05]
+    for row in rows:  # λ=0：objective 与 data loss 一致
+        assert float(row["train_objective_loss"]) == pytest.approx(float(row["train_loss"]))
 
 
 # ---------- 优化器选择与 config 兼容 ----------
@@ -895,4 +900,350 @@ def test_cli_rejects_invalid_new_options():
     assert _run_cli(["--patience", "0"]).returncode != 0
     assert _run_cli(["--min-delta", "-0.5"]).returncode != 0
     assert _run_cli(["--min-delta", "nan"]).returncode != 0
+
+
+# ---------------------------------------------------------------------------
+# P5.2-C 新增：L2 正则化、测试集隔离与运行角色
+# 全部使用合成数据与桩，不依赖 MNIST。
+# ---------------------------------------------------------------------------
+
+from tests.test_mnist_data import _idx_images_bytes, _idx_labels_bytes, _write_gz  # noqa: E402
+
+
+# ---------- A. L2 数学与不污染梯度 ----------
+
+
+def test_l2_penalty_helper_hand_computed():
+    params = {
+        "W1": np.array([[1.0, 2.0], [3.0, 4.0]]),  # Σ² = 1+4+9+16 = 30
+        "b1": np.array([[100.0]]),                 # 偏置绝不计入
+        "W2": np.array([[0.0, 0.0]]),
+    }
+    assert l2_penalty(params, 0.1) == pytest.approx(0.5 * 0.1 * 30)
+    assert l2_penalty(params, 0.0) == 0.0  # λ=0 恒为 0，保持历史数值路径
+
+
+def test_add_l2_gradient_helper_no_mutation():
+    params = {"W1": np.array([[2.0]]), "b1": np.array([[7.0]])}
+    original_grads = {"W1": np.array([[0.5]]), "b1": np.array([[0.3]])}
+    snapshot = {key: value.copy() for key, value in original_grads.items()}
+    regularized = add_l2_gradient(original_grads, params, 0.1)
+    # 权重梯度 + λ·W：0.5 + 0.1*2 = 0.7；偏置不变
+    np.testing.assert_allclose(regularized["W1"], [[0.7]])
+    np.testing.assert_array_equal(regularized["b1"], [[0.3]])
+    # 原始 backward 梯度数组逐元素不变，且权重梯度是新数组（无别名）
+    np.testing.assert_array_equal(original_grads["W1"], snapshot["W1"])
+    np.testing.assert_array_equal(original_grads["b1"], snapshot["b1"])
+    assert regularized["W1"] is not original_grads["W1"]
+    # 加项恰好为 λ·W（与 batch size 无关）
+    np.testing.assert_allclose(regularized["W1"] - original_grads["W1"], 0.1 * params["W1"])
+
+
+def test_l2_gradient_term_independent_of_batch_size():
+    # 不同 batch size 下，加入的 L2 分量都恰好是 λ·W（不得二次除以 batch size），
+    # 偏置梯度与原始梯度数组保持不变
+    model = MLP(4, [5], 3, hidden_activation="tanh", seed=0)
+    rng = np.random.default_rng(0)
+    for m in (4, 8):
+        X = rng.normal(size=(m, 4))
+        y = rng.integers(0, 3, size=m)
+        logits, cache = model.forward(X, return_cache=True)
+        _, dlogits = softmax_cross_entropy(logits, y)
+        data_grads = model.backward(dlogits, cache)
+        snapshot = {key: value.copy() for key, value in data_grads.items()}
+        obj_grads = add_l2_gradient(data_grads, model.params, 0.05)
+        for key in obj_grads:
+            if key.startswith("W"):
+                np.testing.assert_allclose(
+                    obj_grads[key] - data_grads[key], 0.05 * model.params[key]
+                )
+            else:
+                np.testing.assert_array_equal(obj_grads[key], data_grads[key])
+        for key in data_grads:
+            np.testing.assert_array_equal(data_grads[key], snapshot[key])
+
+
+def test_l2_objective_hand_computed_single_batch():
+    # 单 mini-batch（batch_size >= 样本数）：一个 epoch = 一次更新，
+    # penalty 使用更新前参数，可精确手算 objective = data_loss + penalty
+    X, y, tr, va, _te = _tiny_split()
+    model = MLP(2, [8], 3, hidden_activation="tanh", seed=0)
+    initial_params = model.get_params_copy()
+    expected_penalty = l2_penalty(initial_params, 0.5)
+    result = train_model(
+        model, X[tr], y[tr], X[va], y[va],
+        epochs=1, batch_size=1024, learning_rate=0.1, seed=0, l2_lambda=0.5,
+    )
+    row = result.history[0]
+    assert row["train_objective_loss"] == pytest.approx(
+        row["train_loss"] + expected_penalty, rel=1e-12
+    )
+    assert row["train_objective_loss"] > row["train_loss"]
+    # λ=0：objective 与 data loss 逐位相等
+    model0 = MLP(2, [8], 3, hidden_activation="tanh", seed=0)
+    result0 = train_model(
+        model0, X[tr], y[tr], X[va], y[va],
+        epochs=1, batch_size=1024, learning_rate=0.1, seed=0, l2_lambda=0.0,
+    )
+    assert result0.history[0]["train_objective_loss"] == result0.history[0]["train_loss"]
+
+
+def test_l2_lambda_zero_matches_default_path():
+    # 显式 l2_lambda=0.0 与默认路径（缺省键）产生完全相同的训练历史
+    X, y, tr, va, _te = _tiny_split()
+
+    def run(**kwargs):
+        model = MLP(2, [8], 3, hidden_activation="tanh", seed=3)
+        return train_model(
+            model, X[tr], y[tr], X[va], y[va],
+            epochs=2, batch_size=32, learning_rate=0.1, seed=3, **kwargs,
+        )
+
+    r_default = run()
+    r_zero = run(l2_lambda=0.0)
+    for a, b in zip(r_default.history, r_zero.history):
+        # 除耗时外全字段逐位一致（含 objective == data loss）
+        for key in a:
+            if key == "elapsed_seconds":
+                continue
+            assert a[key] == b[key]
+
+
+def test_val_loss_is_pure_data_loss_with_l2():
+    # λ>0 时 val_loss 必须是纯 data loss：与最终参数的独立重算一致，不含 penalty
+    X, y, tr, va, _te = _tiny_split()
+    model = MLP(2, [8], 3, hidden_activation="tanh", seed=0)
+    result = train_model(
+        model, X[tr], y[tr], X[va], y[va],
+        epochs=1, batch_size=32, learning_rate=0.1, seed=0, l2_lambda=1.0,
+    )
+    recomputed, _ = evaluate(model, X[va], y[va])
+    assert result.history[0]["val_loss"] == pytest.approx(recomputed, rel=1e-12)
+    assert result.history[0]["train_objective_loss"] > result.history[0]["train_loss"]
+
+
+@pytest.mark.parametrize(
+    "bad, expected_exception",
+    [
+        (-1e-4, ValueError),
+        (float("nan"), ValueError),
+        (float("inf"), ValueError),
+        (True, TypeError),
+        ("0.1", TypeError),
+        (None, TypeError),
+    ],
+)
+def test_invalid_l2_lambda_rejected(bad, expected_exception):
+    X, y, tr, va, _te = _tiny_split()
+    model = MLP(2, [8], 3, seed=0)
+    with pytest.raises(expected_exception):
+        train_model(
+            model, X[tr], y[tr], X[va], y[va],
+            epochs=1, batch_size=32, learning_rate=0.1, seed=0, l2_lambda=bad,
+        )
+
+
+# ---------- B. 测试集隔离与运行角色 ----------
+
+
+def test_default_path_evaluates_test_exactly_once(monkeypatch, tmp_path):
+    from src import training as training_module
+
+    real_evaluate = training_module.evaluate
+    X, y, tr, va, te = _tiny_split()
+    test_images = X[te]
+    calls = {"test": 0}
+
+    def spy(model, X_eval, y_eval, batch_size=1000):
+        if X_eval is test_images:
+            calls["test"] += 1
+        return real_evaluate(model, X_eval, y_eval, batch_size=batch_size)
+
+    monkeypatch.setattr(training_module, "evaluate", spy)
+    summary = run_experiment(
+        train_images=X[tr], train_labels=y[tr],
+        val_images=X[va], val_labels=y[va],
+        test_images=test_images, test_labels=y[te],
+        config=_tiny_config(), output_root=tmp_path, run_name="default_eval",
+    )
+    assert calls["test"] == 1  # 测试集恰好评估一次
+    assert summary["test_evaluation"] == "executed"
+    assert summary["experiment_role"] == "baseline"
+    # 指标与 checkpoint 独立重算一致（P4 证明方式）
+    reference = MLP(2, [8], 3, hidden_activation="tanh", seed=0).params
+    best_params = load_checkpoint(tmp_path / "default_eval" / "best_model.npz", reference)
+    eval_model = MLP(2, [8], 3, hidden_activation="tanh", seed=999)
+    eval_model.set_params(best_params)
+    loss, acc = real_evaluate(eval_model, test_images, y[te])
+    assert loss == pytest.approx(summary["test_loss"])
+    assert acc == pytest.approx(summary["test_accuracy"])
+
+
+def test_validation_only_path_never_evaluates_test(monkeypatch, tmp_path):
+    from src import training as training_module
+
+    real_evaluate = training_module.evaluate
+    X, y, tr, va, te = _tiny_split()
+    test_images = X[te]
+    seen_arrays = []
+
+    def spy(model, X_eval, y_eval, batch_size=1000):
+        seen_arrays.append(X_eval)
+        return real_evaluate(model, X_eval, y_eval, batch_size=batch_size)
+
+    monkeypatch.setattr(training_module, "evaluate", spy)
+    summary = run_experiment(
+        train_images=X[tr], train_labels=y[tr],
+        val_images=X[va], val_labels=y[va],
+        test_images=test_images, test_labels=y[te],
+        config=_tiny_config(), output_root=tmp_path, run_name="val_only",
+        evaluate_test=False,
+    )
+    # 测试集数组从未被任何 evaluate 调用看到——不是隐藏指标，而是真的没算
+    assert all(array is not test_images for array in seen_arrays)
+    assert summary["test_evaluation"] == "not_run"
+    assert summary["test_loss"] is None
+    assert summary["test_accuracy"] is None
+    assert summary["experiment_role"] == "exploration"
+    # 其余产物齐全、状态成功
+    run_dir = tmp_path / "val_only"
+    assert (run_dir / "config.json").is_file()
+    assert (run_dir / "history.csv").is_file()
+    assert (run_dir / "best_model.npz").is_file()
+    # JSON 中未评估指标编码为 null（而非 0）
+    raw = (run_dir / "summary.json").read_text(encoding="utf-8")
+    assert '"test_loss": null' in raw
+    assert '"test_accuracy": null' in raw
+    saved_summary = json.loads(raw)
+    assert saved_summary["status"] == "success"
+    # config.json 记录角色、评估策略与 l2_lambda
+    saved_config = json.loads((run_dir / "config.json").read_text(encoding="utf-8"))
+    assert saved_config["experiment_role"] == "exploration"
+    assert saved_config["evaluate_test"] is False
+    assert saved_config["training"]["l2_lambda"] == 0.0
+
+
+@pytest.mark.parametrize(
+    "role, evaluate_test, expected_state",
+    [
+        ("baseline", True, "executed"),
+        ("exploration", False, "not_run"),
+        ("final", True, "executed"),
+    ],
+)
+def test_experiment_role_matrix_legal(monkeypatch, tmp_path, role, evaluate_test, expected_state):
+    X, y, tr, va, te = _tiny_split()
+    summary = run_experiment(
+        train_images=X[tr], train_labels=y[tr],
+        val_images=X[va], val_labels=y[va],
+        test_images=X[te], test_labels=y[te],
+        config=_tiny_config(), output_root=tmp_path, run_name=f"role_{role}",
+        evaluate_test=evaluate_test, experiment_role=role,
+    )
+    assert summary["experiment_role"] == role
+    assert summary["test_evaluation"] == expected_state
+    if evaluate_test:
+        assert isinstance(summary["test_loss"], float)
+    else:
+        assert summary["test_loss"] is None
+        assert summary["test_accuracy"] is None
+
+
+@pytest.mark.parametrize(
+    "role, evaluate_test",
+    [("baseline", False), ("exploration", True), ("final", False)],
+)
+def test_experiment_role_matrix_illegal_rejected_before_run_dir(tmp_path, role, evaluate_test):
+    X, y, tr, va, te = _tiny_split()
+    with pytest.raises(ValueError, match="experiment_role"):
+        run_experiment(
+            train_images=X[tr], train_labels=y[tr],
+            val_images=X[va], val_labels=y[va],
+            test_images=X[te], test_labels=y[te],
+            config=_tiny_config(), output_root=tmp_path, run_name=f"bad_{role}",
+            evaluate_test=evaluate_test, experiment_role=role,
+        )
+    assert not (tmp_path / f"bad_{role}").exists()  # 校验发生在创建运行目录之前
+
+
+def test_default_role_derivation_never_yields_final(tmp_path):
+    X, y, tr, va, te = _tiny_split()
+    s1 = run_experiment(
+        train_images=X[tr], train_labels=y[tr],
+        val_images=X[va], val_labels=y[va],
+        test_images=X[te], test_labels=y[te],
+        config=_tiny_config(), output_root=tmp_path, run_name="derive_baseline",
+        evaluate_test=True,
+    )
+    s2 = run_experiment(
+        train_images=X[tr], train_labels=y[tr],
+        val_images=X[va], val_labels=y[va],
+        test_images=X[te], test_labels=y[te],
+        config=_tiny_config(), output_root=tmp_path, run_name="derive_exploration",
+        evaluate_test=False,
+    )
+    assert s1["experiment_role"] == "baseline"
+    assert s2["experiment_role"] == "exploration"
+    assert s1["experiment_role"] != "final" and s2["experiment_role"] != "final"
+
+
+# ---------- CLI ----------
+
+
+def test_cli_help_shows_p52c_options():
+    proc = _run_cli(["--help"])
+    assert proc.returncode == 0
+    for flag in ("--l2-lambda", "--no-test-evaluation", "--experiment-role"):
+        assert flag in proc.stdout
+
+
+def test_cli_rejects_invalid_p52c_options():
+    assert _run_cli(["--l2-lambda", "-1"]).returncode != 0
+    assert _run_cli(["--l2-lambda", "nan"]).returncode != 0
+    assert _run_cli(["--experiment-role", "debug"]).returncode != 0
+
+
+def _write_synthetic_mnist_dir(data_dir):
+    """构造 30 张训练 + 10 张测试的小型合成 MNIST 目录（每类 3/1 张）。"""
+    data_dir.mkdir(parents=True, exist_ok=True)
+    _write_gz(data_dir / "train-images-idx3-ubyte.gz", _idx_images_bytes(30, seed=1))
+    _write_gz(data_dir / "train-labels-idx1-ubyte.gz", _idx_labels_bytes(list(range(10)) * 3))
+    _write_gz(data_dir / "t10k-images-idx3-ubyte.gz", _idx_images_bytes(10, seed=2))
+    _write_gz(data_dir / "t10k-labels-idx1-ubyte.gz", _idx_labels_bytes(list(range(10))))
+    return data_dir
+
+
+def test_cli_no_test_evaluation_produces_validation_only_run(tmp_path):
+    data_dir = _write_synthetic_mnist_dir(tmp_path / "data")
+    out = tmp_path / "out"
+    proc = _run_cli([
+        "--data-dir", str(data_dir), "--output-dir", str(out),
+        "--train-size", "10", "--val-size", "10", "--epochs", "1",
+        "--no-test-evaluation", "--run-name", "val_only_cli",
+    ])
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+    summary_path = out / "val_only_cli" / "summary.json"
+    raw = summary_path.read_text(encoding="utf-8")
+    summary = json.loads(raw)
+    assert summary["test_evaluation"] == "not_run"
+    assert summary["test_loss"] is None
+    assert summary["test_accuracy"] is None
+    assert summary["experiment_role"] == "exploration"
+    assert '"test_loss": null' in raw  # JSON 编码为 null 而非 0
+    assert (out / "val_only_cli" / "best_model.npz").is_file()
+
+
+def test_cli_role_conflict_fails_before_training(tmp_path):
+    data_dir = _write_synthetic_mnist_dir(tmp_path / "data")
+    out = tmp_path / "out"
+    # exploration 必须配合 --no-test-evaluation：冲突组合给出可理解错误
+    proc = _run_cli([
+        "--data-dir", str(data_dir), "--output-dir", str(out),
+        "--train-size", "10", "--val-size", "10", "--epochs", "1",
+        "--experiment-role", "exploration",
+    ])
+    assert proc.returncode != 0
+    assert "experiment_role" in proc.stdout + proc.stderr
+    # 校验失败发生在创建运行目录之前
+    assert not out.exists() or not any(out.iterdir())
 

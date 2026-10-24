@@ -46,6 +46,7 @@ HISTORY_FIELDS = (
     "val_accuracy",
     "elapsed_seconds",
     "lr",
+    "train_objective_loss",
 )
 
 
@@ -84,6 +85,40 @@ def _iterate_minibatches(n_samples: int, batch_size: int, rng: np.random.Generat
     permutation = rng.permutation(n_samples)
     for start in range(0, n_samples, batch_size):
         yield permutation[start : start + batch_size]
+
+
+def l2_penalty(params: dict, l2_lambda: float) -> float:
+    """L2 penalty 项：(λ/2)·Σ_l ||W_l||_F²。
+
+    仅惩罚权重矩阵（键以 "W" 开头），绝不惩罚偏置；λ=0 时恒返回 0.0，
+    保证无正则路径与历史训练的数值行为逐位一致。
+    """
+    if l2_lambda == 0.0:
+        return 0.0
+    squared_sum = 0.0
+    for key, value in params.items():
+        if key.startswith("W"):
+            squared_sum += float(np.sum(value * value))
+    return 0.5 * l2_lambda * squared_sum
+
+
+def add_l2_gradient(grads: dict, params: dict, l2_lambda: float) -> dict:
+    """返回加入 L2 梯度项后的新梯度字典：∇_W J_obj = ∇_W J_data + λ·W。
+
+    * 偏置梯度原样保留（L2 不作用于偏置）；
+    * 权重梯度通过 `value + λ·W` 生成新数组，绝不就地修改 backward 返回的
+      原始梯度数组（因此 λ 项与 batch size 无关，不会被二次平均）；
+    * λ=0 时原样返回传入字典。
+    """
+    if l2_lambda == 0.0:
+        return grads
+    regularized: dict = {}
+    for key, value in grads.items():
+        if key.startswith("W"):
+            regularized[key] = value + l2_lambda * params[key]
+        else:
+            regularized[key] = value
+    return regularized
 
 
 @dataclass
@@ -125,6 +160,7 @@ def train_model(
     early_stopping: bool = False,
     patience: int = 5,
     min_delta: float = 1e-4,
+    l2_lambda: float = 0.0,
     eval_batch_size: int = 1000,
     verbose: bool = False,
 ) -> TrainingResult:
@@ -159,6 +195,18 @@ def train_model(
     其余语义与 P4 保持一致：每 epoch 独立可复现打乱、尾批不丢弃、在线训练
     指标按样本数加权、非有限值快速失败并指出 epoch/batch、最佳参数深复制
     快照不被后续 epoch 覆盖。
+
+    L2 正则化（冻结约定）
+    --------------------
+    * J_obj = J_data + (λ/2)·Σ_l ||W_l||_F²，仅惩罚权重矩阵，绝不惩罚偏置；
+    * 权重梯度加 λ·W（softmax_cross_entropy 的 dlogits 已含 batch 平均，
+      L2 项不得再除以 batch size），偏置梯度不变；
+    * penalty 与梯度项均使用本次反向传播之前的模型参数（同一更新前模型）；
+    * 不就地修改 backward 返回的原始梯度数组——正则化梯度由 add_l2_gradient
+      生成新数组；
+    * train_loss 仍是纯训练数据损失（在线、按样本数加权）；train_objective_loss
+      为数据损失 + L2 penalty 的训练目标，两者分列记录；λ=0 时两者逐位相等；
+    * val_loss / 模型选择 / 测试评估全部保持纯 data loss，不掺 L2 项。
     """
     if isinstance(epochs, bool) or not isinstance(epochs, (int, np.integer)) or epochs <= 0:
         raise ValueError(f"epochs must be a positive integer, got {epochs!r}.")
@@ -213,6 +261,13 @@ def train_model(
         raise ValueError(
             f"min_delta must be a finite non-negative real number, got {min_delta!r}."
         )
+    if isinstance(l2_lambda, bool) or not isinstance(l2_lambda, (int, float, np.integer, np.floating)):
+        raise TypeError(f"l2_lambda must be a real number, got {type(l2_lambda).__name__}.")
+    l2_lambda = float(l2_lambda)
+    if not np.isfinite(l2_lambda) or l2_lambda < 0.0:
+        raise ValueError(
+            f"l2_lambda must be a finite non-negative real number, got {l2_lambda!r}."
+        )
     train_X = np.asarray(train_X)
     train_y = np.asarray(train_y)
     val_X = np.asarray(val_X)
@@ -249,6 +304,7 @@ def train_model(
             effective_lr = base_lr
         optimizer.learning_rate = effective_lr
         loss_sum = 0.0
+        objective_sum = 0.0
         correct = 0
         seen = 0
         for batch_number, batch_idx in enumerate(
@@ -260,22 +316,33 @@ def train_model(
                 logits, cache = model.forward(batch_X, return_cache=True)
                 loss, dlogits = softmax_cross_entropy(logits, batch_y)
                 grads = model.backward(dlogits, cache)
+                if l2_lambda > 0.0:
+                    # J_obj = J_data + (λ/2)Σ||W||²：penalty 与 λ·W 梯度项都用
+                    # 本次反向传播之前的模型参数；不除以 batch size、不修改
+                    # backward 返回的原始梯度数组
+                    penalty = l2_penalty(model.params, l2_lambda)
+                    grads = add_l2_gradient(grads, model.params, l2_lambda)
+                else:
+                    penalty = 0.0
+                objective = loss + penalty
                 optimizer.step(model.params, grads)
             except (TypeError, ValueError) as exc:
                 raise RuntimeError(
                     f"training failed at epoch {epoch} batch {batch_number}: {exc}"
                 ) from exc
-            if not np.isfinite(loss):
+            if not np.isfinite(loss) or not np.isfinite(objective):
                 raise RuntimeError(
-                    f"non-finite loss {loss!r} at epoch {epoch} batch {batch_number}; "
-                    f"refusing to continue with a corrupt model."
+                    f"non-finite loss {loss!r} or objective {objective!r} at epoch {epoch} "
+                    f"batch {batch_number}; refusing to continue with a corrupt model."
                 )
             # 在线训练指标：此处 logits 是参数更新前的输出，按样本数加权累计
             loss_sum += float(loss) * len(batch_idx)
+            objective_sum += float(objective) * len(batch_idx)
             correct += int(np.sum(np.argmax(logits, axis=1) == batch_y))
             seen += len(batch_idx)
 
         train_loss = loss_sum / seen
+        train_objective_loss = objective_sum / seen
         train_accuracy = correct / seen
         try:
             val_loss, val_accuracy = evaluate(model, val_X, val_y, batch_size=eval_batch_size)
@@ -297,6 +364,7 @@ def train_model(
                 "val_accuracy": val_accuracy,
                 "elapsed_seconds": elapsed,
                 "lr": effective_lr,
+                "train_objective_loss": train_objective_loss,
             }
         )
         # raw-best checkpoint：只看原始 val_loss 严格下降（并列保留更早 epoch），
@@ -430,16 +498,53 @@ def run_experiment(
     output_root,
     run_name: str = None,
     verbose: bool = False,
+    evaluate_test: bool = True,
+    experiment_role: str | None = None,
 ) -> dict:
-    """端到端编排：建运行目录 → 写 config → 训练 → 选最佳 → 测试集评估一次 → 保存产物。
+    """端到端编排：建运行目录 → 写 config → 训练 → 选最佳 → 测试评估 → 保存产物。
+
+    运行角色与测试集隔离（P5.2-C）
+    ------------------------------
+    * baseline（默认推导：evaluate_test=True）：历史兼容的基线入口，
+      必须执行测试评估；
+    * exploration（默认推导：evaluate_test=False）：探索/调参 run，
+      validation-only——完全跳过测试集 evaluate 调用，summary 的
+      test_evaluation="not_run"，test_loss/test_accuracy 为 JSON null；
+    * final：完整实验方案冻结后的正式确认评估，必须显式传入；
+      任何默认路径都不会推导出 final；
+    * 角色/评估组合不匹配（如 exploration+evaluate_test=True）或未知角色
+      会在创建运行目录、写入任何产物之前抛出 ValueError；
+    * config.json 顶层记录 experiment_role 与 evaluate_test，
+      training.l2_lambda 记录实际使用的正则系数。
 
     config 需包含 network / training / seeds / data 四节（见 CLI 的组装方式）。
     训练失败时异常向上传播，目录里只留下 config.json，绝不会出现标记为成功
     却缺少关键指标的 summary.json。
     """
+    if not isinstance(evaluate_test, bool):
+        raise TypeError(f"evaluate_test must be a bool, got {type(evaluate_test).__name__}.")
+    allowed_roles = ("baseline", "exploration", "final")
+    if experiment_role is None:
+        # 默认推导：baseline / exploration；任何默认路径都不会产生 final
+        experiment_role = "baseline" if evaluate_test else "exploration"
+    elif not isinstance(experiment_role, str) or experiment_role not in allowed_roles:
+        raise ValueError(
+            f"unsupported experiment_role {experiment_role!r}; "
+            f"choices: {', '.join(allowed_roles)}."
+        )
+    expected_evaluation = {"baseline": True, "exploration": False, "final": True}[experiment_role]
+    if evaluate_test != expected_evaluation:
+        raise ValueError(
+            f"experiment_role {experiment_role!r} requires evaluate_test="
+            f"{expected_evaluation}, got {evaluate_test}; baseline/final runs evaluate "
+            f"the test set, exploration runs are validation-only."
+        )
+
     run_dir = create_run_directory(output_root, run_name)
     effective_config = json.loads(json.dumps(config))  # 深复制，避免污染调用方
     effective_config["environment"] = _environment_info()
+    effective_config["experiment_role"] = experiment_role
+    effective_config["evaluate_test"] = evaluate_test
     effective_config.setdefault("data", {})
     effective_config["data"]["sample_counts"] = {
         "train": int(np.asarray(train_images).shape[0]),
@@ -460,6 +565,7 @@ def run_experiment(
     effective_training.setdefault("early_stopping", False)
     effective_training.setdefault("patience", 5)
     effective_training.setdefault("min_delta", 1e-4)
+    effective_training.setdefault("l2_lambda", 0.0)
     with open(run_dir / "config.json", "w", encoding="utf-8") as handle:
         json.dump(effective_config, handle, indent=2, ensure_ascii=False)
 
@@ -510,21 +616,31 @@ def run_experiment(
         early_stopping=training_config["early_stopping"],
         patience=training_config["patience"],
         min_delta=training_config["min_delta"],
+        l2_lambda=training_config["l2_lambda"],
         eval_batch_size=training_config.get("eval_batch_size", 1000),
         verbose=verbose,
     )
 
-    # 测试集只在训练与验证集选型全部完成后评估这一次。
-    # model 训练结束时处于最后一个 epoch；必须先恢复到最佳 epoch 的参数，
-    # 保证 summary 中的测试指标与 best_model.npz 保存的是同一组参数。
-    model.set_params(result.best_params)
-    test_loss, test_accuracy = evaluate(model, test_images, test_labels)
+    if evaluate_test:
+        # 测试集只在训练与验证集选型全部完成后评估这一次；评估前必须恢复
+        # 最佳 epoch 参数，保证测试指标与 best_model.npz 是同一组参数。
+        # 探索路径（evaluate_test=False）完全不进入此分支。
+        model.set_params(result.best_params)
+        test_loss, test_accuracy = evaluate(model, test_images, test_labels)
+        test_evaluation = "executed"
+    else:
+        # 未评估的指标必须是 JSON null，绝不能写成 0 或伪造数值
+        test_loss = None
+        test_accuracy = None
+        test_evaluation = "not_run"
 
     write_history_csv(result.history, run_dir / "history.csv")
     save_checkpoint(result.best_params, run_dir / "best_model.npz")
     summary = {
         "status": "success",
         "run_dir": str(run_dir),
+        "experiment_role": experiment_role,
+        "test_evaluation": test_evaluation,
         "stop_reason": result.stop_reason,
         "best_epoch": result.best_epoch,
         "best_validation_loss": result.best_val_loss,

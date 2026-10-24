@@ -597,3 +597,40 @@ def test_sgd_representable_float32_update_succeeds():
     assert params["w"].dtype == np.float32  # dtype 保持
     assert np.all(np.isfinite(params["w"]))  # 全部有限
     np.testing.assert_allclose(params["w"], [1.0 - 0.1 * 0.5], rtol=1e-6, atol=0)
+
+
+# ---------------------------------------------------------------------------
+# P5.2-A-R3 整改：SGD 对只读参数数组的预检与原子性
+# ---------------------------------------------------------------------------
+
+
+def test_sgd_readonly_parameter_rejected_before_any_write():
+    # a_writable 排序在前、z_readonly 在后：旧实现（无可写性预检）会先提交
+    # a_writable，再在写入 z_readonly 时才被 NumPy 以"assignment destination
+    # is read-only"拒绝——a_writable 已被改写且无法回滚（部分写入）。
+    # 排序设计保证"值未变"的原子性断言（而非异常本身）能区分新旧实现。
+    params = {
+        "a_writable": np.array([1.0, 2.0], dtype=np.float64),
+        "z_readonly": np.array([3.0, 4.0], dtype=np.float64),
+    }
+    params["z_readonly"].setflags(write=False)
+    handles = {key: params[key] for key in params}
+    original_dtypes = {key: params[key].dtype for key in params}
+    snapshots = {key: params[key].copy() for key in params}
+    grads = {
+        "a_writable": np.array([0.1, -0.2], dtype=np.float64),
+        "z_readonly": np.array([0.3, 0.4], dtype=np.float64),
+    }
+    grads_snapshot = {key: value.copy() for key, value in grads.items()}
+
+    with pytest.raises(ValueError, match="read-only"):
+        SGD(0.1).step(params, grads)
+
+    # 两个参数都必须逐元素保持原值：旧实现下 a_writable 已被部分更新，此断言失败
+    for key in params:
+        np.testing.assert_array_equal(params[key], snapshots[key])
+        assert params[key] is handles[key]
+        assert params[key].dtype == original_dtypes[key]
+    # 梯度数组未被修改
+    for key in grads:
+        np.testing.assert_array_equal(grads[key], grads_snapshot[key])

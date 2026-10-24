@@ -88,6 +88,13 @@ class SGD:
                 )
             if not np.issubdtype(p.dtype, np.floating):
                 raise TypeError(f"param {key!r} must have a floating dtype, got {p.dtype}.")
+            if not p.flags.writeable:
+                # 与 _StatefulOptimizer._validate_inputs 对齐：只读数组必须在
+                # 任何候选计算与提交之前拒绝，否则多参数更新时可能先写入
+                # 排序在前的可写参数、再在只读参数上失败，造成部分写入。
+                raise ValueError(
+                    f"param {key!r} is a read-only array; in-place update is impossible."
+                )
             if not isinstance(g, np.ndarray):
                 raise TypeError(f"grad {key!r} must be a numpy.ndarray, got {type(g).__name__}.")
             if np.issubdtype(g.dtype, np.complexfloating) or not np.issubdtype(g.dtype, np.number):

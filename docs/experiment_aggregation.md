@@ -104,6 +104,9 @@ null、类型错误或越界数值都会写入**定位到字段**的诊断并判
   `precision`、`recall`、`f1`（[0,1] 内有限数值）与 `support`（非负整数，等于
   混淆矩阵对应**行和**）。**零分母规则**：某类预测正例数为 0 时 precision 记
   0.0；真实 support 为 0 时 recall 记 0.0；precision+recall 为 0 时 f1 记 0.0。
+  逐类与 macro 的数值字段必须是可安全表示为有限浮点的数——JSON 中合法但超出
+  浮点表示范围的极大整数（如 10**400）判 `invalid` 并附定位诊断，绝不使汇总器
+  以未捕获 OverflowError 崩溃。
 * `test_macro_avg`：`precision`/`recall`/`f1` 各为 C 类逐类指标的**不加权算术
   平均**（不按 support 加权、不剔除零 support 类别），汇总器按容差 1e-9 与逐类
   直接重算值核对。

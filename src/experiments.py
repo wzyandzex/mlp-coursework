@@ -581,9 +581,10 @@ def _validate_final_classification_metrics(summary: dict, config: dict, diagnost
                 entry_ok = True
                 for key in _FINAL_METRIC_KEYS:
                     value = entry.get(key)
-                    if (isinstance(value, bool) or not isinstance(value, (int, float))
-                            or not math.isfinite(float(value))
-                            or not 0.0 <= float(value) <= 1.0):
+                    # _is_finite_number 捕获 OverflowError：极大整数（如 10**400，
+                    # JSON 合法但超出浮点表示范围）安全判 False，不会使汇总器崩溃
+                    if (isinstance(value, bool) or not _is_finite_number(value)
+                            or not 0.0 <= value <= 1.0):
                         diagnostics.append(
                             f"final summary 'test_per_class_metrics'[{cls}][{key!r}] must be "
                             f"a finite number in [0, 1], got {value!r}"
@@ -624,9 +625,9 @@ def _validate_final_classification_metrics(summary: dict, config: dict, diagnost
             macro_ok = True
             for key in _FINAL_METRIC_KEYS:
                 value = macro.get(key)
-                if (isinstance(value, bool) or not isinstance(value, (int, float))
-                        or not math.isfinite(float(value))
-                        or not 0.0 <= float(value) <= 1.0):
+                # 同上：极大整数经 _is_finite_number 安全判 False，不抛 OverflowError
+                if (isinstance(value, bool) or not _is_finite_number(value)
+                        or not 0.0 <= value <= 1.0):
                     diagnostics.append(
                         f"final summary 'test_macro_avg'[{key!r}] must be a finite number "
                         f"in [0, 1], got {value!r}"

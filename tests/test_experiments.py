@@ -1043,3 +1043,85 @@ def test_metric_consistency_fix_not_extended_to_non_final(tmp_path):
     assert report["counts"]["success"] == 1
     runs = _read_json(root / "_aggregate" / "runs.json")["runs"]
     assert runs[0]["status"] == "success" and runs[0]["experiment_role"] == "exploration"
+
+
+# ---------------------------------------------------------------------------
+# P5.3-E6-A-R2 新增：极大整数（JSON 合法但超出浮点范围）必须安全判 invalid。
+# 缺陷：math.isfinite(float(value)) 对 10**400 抛未捕获 OverflowError。
+# ---------------------------------------------------------------------------
+
+_HUGE_INT = 10 ** 400
+
+
+def _final_summary_with_metric(key, cls, value):
+    """把某个 final 分类指标数值字段替换为 value（cls=None 表示 macro）。"""
+    fields = _final_metrics_fields(_final_matrix())
+    if cls is None:
+        fields["test_macro_avg"] = {**fields["test_macro_avg"], key: value}
+    else:
+        fields["test_per_class_metrics"][cls] = {
+            **fields["test_per_class_metrics"][cls], key: value,
+        }
+    return {**_make_summary(experiment_role="final", test_evaluation="executed"), **fields}
+
+
+@pytest.mark.parametrize("key", ("precision", "recall", "f1"))
+def test_final_oversized_per_class_int_rejected_safely(tmp_path, key):
+    """逐类指标含 10**400：默认模式不抛异常，run 判 invalid 且诊断定位到字段。"""
+    root = tmp_path / "outputs"
+    config = _make_config(experiment_role="final", evaluate_test=True, model_seed=404)
+    summary = _final_summary_with_metric(key, 0, _HUGE_INT)
+    _write_run(root, "final_huge", config=config, summary=summary)
+    report = aggregate(root=root, output=root / "_aggregate")  # 默认模式：绝不 traceback
+    assert report["counts"]["invalid"] == 1
+    runs = _read_json(root / "_aggregate" / "runs.json")["runs"]
+    assert runs[0]["status"] == "invalid"
+    assert any(
+        "'test_per_class_metrics'[0]" in d and f"{key!r}" in d
+        for d in runs[0]["diagnostics"]
+    ), runs[0]["diagnostics"]
+
+
+@pytest.mark.parametrize("key", ("precision", "recall", "f1"))
+def test_final_oversized_macro_int_rejected_safely(tmp_path, key):
+    """macro 指标含 10**400：默认模式不抛异常，run 判 invalid 且诊断定位到字段。"""
+    root = tmp_path / "outputs"
+    config = _make_config(experiment_role="final", evaluate_test=True, model_seed=404)
+    summary = _final_summary_with_metric(key, None, _HUGE_INT)
+    _write_run(root, "final_huge_macro", config=config, summary=summary)
+    report = aggregate(root=root, output=root / "_aggregate")
+    assert report["counts"]["invalid"] == 1
+    runs = _read_json(root / "_aggregate" / "runs.json")["runs"]
+    assert runs[0]["status"] == "invalid"
+    assert any(
+        "'test_macro_avg'" in d and f"{key!r}" in d
+        for d in runs[0]["diagnostics"]
+    ), runs[0]["diagnostics"]
+
+
+def test_final_oversized_int_strict_cli_exits_1(tmp_path, capsys):
+    """--strict：聚合正常完成、strict_failed=True、CLI 退出码 1，而非 traceback。"""
+    root = tmp_path / "outputs"
+    config = _make_config(experiment_role="final", evaluate_test=True, model_seed=404)
+    summary = _final_summary_with_metric("precision", 0, _HUGE_INT)
+    _write_run(root, "final_huge", config=config, summary=summary)
+    report = aggregate(root=root, output=root / "_agg_strict", strict=True)
+    assert report["strict_failed"] is True
+    assert report["counts"]["invalid"] == 1
+    assert main(["aggregate", "--root", str(root),
+                 "--output", str(root / "_agg_cli"), "--strict"]) == 1
+    # 输出文件仍完整生成，可被严格 JSON parser 读取
+    parsed = json.loads((root / "_agg_cli" / "runs.json").read_text(encoding="utf-8"))
+    assert parsed["runs"][0]["status"] == "invalid"
+
+
+def test_final_1e400_float_overflow_still_rejected(tmp_path):
+    """既有行为不回退：1e400 浮点字面量（解析为 Infinity）仍被判 invalid。"""
+    root = tmp_path / "outputs"
+    config = _make_config(experiment_role="final", evaluate_test=True, model_seed=404)
+    summary = _final_summary_with_metric("precision", 0, float("1e400"))
+    _write_run(root, "final_inf", config=config, summary=summary)
+    report = aggregate(root=root, output=root / "_aggregate", strict=True)
+    assert report["counts"]["invalid"] == 1
+    runs = _read_json(root / "_aggregate" / "runs.json")["runs"]
+    assert runs[0]["status"] == "invalid"

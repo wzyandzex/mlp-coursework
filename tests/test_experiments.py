@@ -81,6 +81,48 @@ def _read_json(path):
     return json.loads(Path(path).read_text(encoding="utf-8"))
 
 
+def _final_matrix(num_classes=10, diag=930, errors=((0, 1, 700),)):
+    """构造总数 = diag*num_classes + sum(errors) 的方形整数混淆矩阵。
+
+    默认参数下总数 10000、对角线 9300，对角线占比 0.93。
+    """
+    matrix = [[0] * num_classes for _ in range(num_classes)]
+    for i in range(num_classes):
+        matrix[i][i] = diag
+    for i, j, count in errors:
+        matrix[i][j] += count
+    return matrix
+
+
+def _final_metrics_fields(matrix, *, test_loss=0.2):
+    """用测试文件内独立手写的纯 Python 实现从矩阵导出分类指标字段。
+
+    与被测实现相互独立，用于构造合法 final fixture 并交叉复核汇总器输出。
+    """
+    size = len(matrix)
+    per_class = []
+    for cls in range(size):
+        tp = matrix[cls][cls]
+        support = sum(matrix[cls])
+        predicted = sum(matrix[row][cls] for row in range(size))
+        precision = tp / predicted if predicted else 0.0
+        recall = tp / support if support else 0.0
+        f1 = 2 * precision * recall / (precision + recall) if (precision + recall) else 0.0
+        per_class.append({"precision": precision, "recall": recall, "f1": f1,
+                          "support": support})
+    macro = {key: sum(entry[key] for entry in per_class) / size
+             for key in ("precision", "recall", "f1")}
+    total = sum(sum(row) for row in matrix)
+    accuracy = sum(matrix[i][i] for i in range(size)) / total
+    return {
+        "test_loss": test_loss,
+        "test_accuracy": accuracy,
+        "test_confusion_matrix": matrix,
+        "test_per_class_metrics": per_class,
+        "test_macro_avg": macro,
+    }
+
+
 # ---------- 1. 单个成功 run 的解析 ----------
 
 
@@ -182,9 +224,11 @@ def test_differences_other_than_model_seed_prevent_grouping(tmp_path):
                                      test_loss=0.1, test_accuracy=0.95))
     _write_run(root, "diff_eval",
                config=_make_config(model_seed=2, experiment_role="final", evaluate_test=True),
-               summary=_make_summary(experiment_role="final",
-                                     test_evaluation="executed",
-                                     test_loss=0.2, test_accuracy=0.93))
+               summary={**_make_summary(experiment_role="final",
+                                        test_evaluation="executed",
+                                        test_loss=0.2, test_accuracy=0.93),
+                        # 当前 schema 的 final run 必须携带完整分类指标字段
+                        **_final_metrics_fields(_final_matrix())})
     report = aggregate(root=root, output=root / "_aggregate")
     groups = _read_json(root / "_aggregate" / "groups.json")["groups"]
     assert report["counts"]["success"] == 8
@@ -669,3 +713,194 @@ def test_cli_missing_root_returns_nonzero(tmp_path, capsys):
                       "--output", str(tmp_path / "agg")])
     assert exit_code == 1
     assert "error" in capsys.readouterr().err
+
+
+# ---------------------------------------------------------------------------
+# P5.3-E6-A 新增：final run 分类指标的 schema 校验、保留与跨 seed 组统计。
+# 全部使用手写合成 JSON fixture（2 类小矩阵便于手算），不读取真实测试集。
+# ---------------------------------------------------------------------------
+
+
+def _make_final_run(root, name, *, model_seed, matrix, test_loss):
+    """写一个 schema 合法的合成 final run（矩阵维度决定 config.output_dim）。"""
+    config = _make_config(experiment_role="final", evaluate_test=True, model_seed=model_seed,
+                          l2_lambda=0.0001)
+    config["network"]["output_dim"] = len(matrix)
+    total = sum(sum(row) for row in matrix)
+    config["data"]["sample_counts"]["test"] = total
+    summary = {**_make_summary(experiment_role="final", test_evaluation="executed"),
+               **_final_metrics_fields(matrix, test_loss=test_loss)}
+    summary["sample_counts"]["test"] = total
+    _write_run(root, name, config=config, summary=summary)
+
+
+def test_final_run_record_validated_and_retained(tmp_path):
+    """合法 final run → success；runs.json / runs.csv 无损保留分类指标。"""
+    root = tmp_path / "outputs"
+    matrix = _final_matrix()
+    _make_final_run(root, "final_a", model_seed=404, matrix=matrix, test_loss=0.2)
+    report = aggregate(root=root, output=root / "_aggregate", strict=True)
+    assert report["counts"] == {"success": 1, "incomplete": 0, "invalid": 0, "legacy": 0}
+    runs = _read_json(root / "_aggregate" / "runs.json")["runs"]
+    record = runs[0]
+    assert record["status"] == "success" and record["experiment_role"] == "final"
+    assert record["test_confusion_matrix"] == matrix
+    # class0：TP=930，predicted=930（列和），support=1630（行和，含 700 个错分）
+    assert record["test_per_class_metrics"][0]["precision"] == pytest.approx(1.0)
+    assert record["test_per_class_metrics"][0]["recall"] == pytest.approx(930 / 1630)
+    assert record["test_per_class_metrics"][0]["support"] == 1630
+    # class1：TP=930，predicted=1630（吸收 700 个错分），support=930
+    assert record["test_per_class_metrics"][1]["precision"] == pytest.approx(930 / 1630)
+    assert record["test_per_class_metrics"][1]["recall"] == pytest.approx(1.0)
+    # macro recall = (930/1630 + 1.0 + 8×1.0) / 10
+    assert record["test_macro_avg"]["recall"] == pytest.approx((930 / 1630 + 9.0) / 10)
+    with open(root / "_aggregate" / "runs.csv", newline="", encoding="utf-8") as handle:
+        row = next(csv.DictReader(handle))
+    # CSV 复杂结构为紧凑规范化 JSON（双引号、无空格），不是 Python repr
+    assert json.loads(row["test_confusion_matrix_json"]) == matrix
+    assert "'" not in row["test_confusion_matrix_json"]
+    assert json.loads(row["test_macro_avg_json"]) == record["test_macro_avg"]
+
+
+def test_final_missing_fields_invalid(tmp_path):
+    root = tmp_path / "outputs"
+    config = _make_config(experiment_role="final", evaluate_test=True)
+    summary = _make_summary(experiment_role="final", test_evaluation="executed",
+                            test_loss=0.2, test_accuracy=0.93)
+    _write_run(root, "final_nofields", config=config, summary=summary)
+    report = aggregate(root=root, output=root / "_aggregate", strict=True)
+    assert report["counts"]["invalid"] == 1
+    runs = _read_json(root / "_aggregate" / "runs.json")["runs"]
+    assert ("final summary missing required field 'test_confusion_matrix'"
+            in runs[0]["diagnostics"])
+
+
+def test_final_corrupt_metrics_invalid(tmp_path):
+    """矩阵形状 / support / macro / 总数 / 对角线-准确率 / 浮点元素任一损坏 → invalid。"""
+    def mutate(name, summary):
+        if name == "shape":
+            summary["test_confusion_matrix"][0] = [8, 2, 0]  # 行宽不一致 → 非方形
+        elif name == "support":
+            summary["test_per_class_metrics"][0]["support"] = 999
+        elif name == "macro":
+            summary["test_macro_avg"]["precision"] = 0.123456
+        elif name == "total":
+            summary["sample_counts"]["test"] = 9999
+        elif name == "diag":
+            summary["test_accuracy"] = 0.99
+        elif name == "float_entry":
+            summary["test_confusion_matrix"][0][0] = 90.0
+        return summary
+
+    for mutation in ("shape", "support", "macro", "total", "diag", "float_entry"):
+        root = tmp_path / f"outputs_{mutation}"
+        matrix = _final_matrix()
+        config = _make_config(experiment_role="final", evaluate_test=True, model_seed=404)
+        config["network"]["output_dim"] = len(matrix)
+        total = sum(sum(row) for row in matrix)
+        config["data"]["sample_counts"]["test"] = total
+        summary = {**_make_summary(experiment_role="final", test_evaluation="executed"),
+                   **_final_metrics_fields(matrix)}
+        summary["sample_counts"]["test"] = total
+        summary = mutate(mutation, summary)
+        _write_run(root, "final_bad", config=config, summary=summary)
+        report = aggregate(root=root, output=root / "_aggregate", strict=True)
+        runs = _read_json(root / "_aggregate" / "runs.json")["runs"]
+        assert report["counts"]["invalid"] == 1, mutation
+        assert runs[0]["status"] == "invalid", mutation
+        assert runs[0]["diagnostics"], mutation
+
+
+def test_final_matrix_dim_must_match_output_dim(tmp_path):
+    root = tmp_path / "outputs"
+    config = _make_config(experiment_role="final", evaluate_test=True, model_seed=404)
+    config["network"]["output_dim"] = 3  # 与 2×2 矩阵不一致
+    config["data"]["sample_counts"]["test"] = 100
+    summary = {**_make_summary(experiment_role="final", test_evaluation="executed"),
+               **_final_metrics_fields(_final_matrix())}
+    summary["sample_counts"]["test"] = 100
+    _write_run(root, "final_dim", config=config, summary=summary)
+    aggregate(root=root, output=root / "_aggregate", strict=True)
+    runs = _read_json(root / "_aggregate" / "runs.json")["runs"]
+    assert runs[0]["status"] == "invalid"
+    assert any("output_dim" in d for d in runs[0]["diagnostics"])
+
+
+def test_non_final_and_legacy_without_fields_unaffected(tmp_path):
+    """baseline/exploration 缺新字段仍为 success；legacy 判定不变。"""
+    root = tmp_path / "outputs"
+    _write_run(root, "base", config=_make_config(experiment_role="baseline", evaluate_test=True),
+               summary=_make_summary(experiment_role="baseline", test_evaluation="executed",
+                                     test_loss=0.1, test_accuracy=0.95))
+    _write_run(root, "exp", config=_make_config(), summary=_make_summary())
+    legacy_config = _make_config()
+    legacy_config.pop("experiment_role")
+    legacy_summary = _make_summary()
+    legacy_summary.pop("test_evaluation")
+    _write_run(root, "old", config=legacy_config, summary=legacy_summary)
+    report = aggregate(root=root, output=root / "_aggregate", strict=True)
+    assert report["counts"] == {"success": 2, "incomplete": 0, "invalid": 0, "legacy": 1}
+    runs = {r["run_name"]: r for r in _read_json(root / "_aggregate" / "runs.json")["runs"]}
+    assert runs["base"]["status"] == "success" and runs["exp"]["status"] == "success"
+    assert runs["old"]["status"] == "legacy"
+    for name in ("base", "exp", "old"):
+        assert runs[name]["test_confusion_matrix"] is None
+
+
+def test_three_final_runs_group_stats(tmp_path):
+    """3 个合成 final run → 单一 3-seed 组；组级 macro/逐类统计可独立复算。"""
+    root = tmp_path / "outputs"
+    matrix_a = [[90, 0], [0, 10]]   # acc 1.0；class1 predicted=10, TP=10 → precision 1.0
+    matrix_b = [[80, 10], [10, 0]]  # acc 0.8；class1 predicted=10, TP=0  → precision 0.0
+    matrix_c = [[70, 20], [0, 10]]  # acc 0.8；class0 p=1.0, r=7/9      → f1 = 7/8
+    for name, seed, matrix, loss in (("f1", 404, matrix_a, 0.1),
+                                     ("f2", 505, matrix_b, 0.3),
+                                     ("f3", 606, matrix_c, 0.3)):
+        _make_final_run(root, name, model_seed=seed, matrix=matrix, test_loss=loss)
+    report = aggregate(root=root, output=root / "_aggregate", strict=True)
+    assert report["counts"]["success"] == 3 and report["strict_failed"] is False
+
+    runs = _read_json(root / "_aggregate" / "runs.json")["runs"]
+    # 混淆矩阵保留在 run 级且互不相同（不跨 seed 求和）
+    assert [r["test_confusion_matrix"] for r in runs] == [matrix_a, matrix_b, matrix_c]
+
+    groups = _read_json(root / "_aggregate" / "groups.json")["groups"]
+    assert len(groups) == 1
+    group = groups[0]
+    assert group["n_runs"] == 3 and group["experiment_role"] == "final"
+    assert group["test_evaluation"] == "executed"
+    stats = group["stats"]
+    assert "test_confusion_matrix" not in stats  # 组级不得出现求和矩阵
+    assert "per-model statistics on the fixed test set" in stats["test_classification_note"]
+    assert "must not be summed across seeds" in stats["test_classification_note"]
+
+    # 组级 macro：用 runs.json 的原始值经 statistics 独立复算
+    macro_by_key = {key: [r["test_macro_avg"][key] for r in runs]
+                    for key in ("precision", "recall", "f1")}
+    for key, values in macro_by_key.items():
+        entry = stats["test_macro_avg"][key]
+        assert entry["n"] == 3
+        assert entry["mean"] == pytest.approx(statistics.fmean(values))
+        assert entry["std"] == pytest.approx(statistics.pstdev(values))
+
+    # 逐类统计：键为类别 0..C-1；每类 mean/std/n 可独立复算
+    assert set(stats["test_per_class_metrics"]) == {"0", "1"}
+    per_class_by_key = {
+        (cls, key): [r["test_per_class_metrics"][cls][key] for r in runs]
+        for cls in range(2) for key in ("precision", "recall", "f1")
+    }
+    for (cls, key), values in per_class_by_key.items():
+        entry = stats["test_per_class_metrics"][str(cls)][key]
+        assert entry["mean"] == pytest.approx(statistics.fmean(values))
+        assert entry["std"] == pytest.approx(statistics.pstdev(values))
+        assert entry["n"] == 3
+
+    # 手算抽查：零预测 precision=0；f1=7/8；support 是逐模型计数（不跨 seed 相加）
+    runs_by_name = {r["run_name"]: r for r in runs}
+    assert runs_by_name["f2"]["test_per_class_metrics"][1]["precision"] == 0.0
+    assert runs_by_name["f3"]["test_per_class_metrics"][0]["f1"] == pytest.approx(7 / 8)
+    assert stats["test_per_class_metrics"]["1"]["precision"]["mean"] == pytest.approx(
+        (1.0 + 0.0 + 1 / 3) / 3
+    )
+    assert stats["test_per_class_metrics"]["0"]["support"] == {"mean": 90.0, "std": 0.0, "n": 3}
+    assert stats["test_per_class_metrics"]["1"]["support"] == {"mean": 10.0, "std": 0.0, "n": 3}

@@ -84,9 +84,51 @@ null、类型错误或越界数值都会写入**定位到字段**的诊断并判
 | `epochs_completed` | 正整数 |
 | `total_seconds` | ≥ 0 的有限数 |
 | `sample_counts` | 含非负整数 `train`/`validation`/`test` 的对象，且与 `config.data.sample_counts` 完全一致 |
+| `test_confusion_matrix` / `test_per_class_metrics` / `test_macro_avg` | **仅 `experiment_role="final"` 必需**（见下节）；baseline/exploration/legacy 缺这些字段是正常状态，不判 invalid |
 
 跨文件一致性：config 与 summary 的 `experiment_role` 必须一致；角色、
 `evaluate_test` 与 `test_evaluation` 必须满足隔离矩阵；`sample_counts` 必须一致。
+
+## final run 分类指标（P5.3-E6-A）
+
+仅 `experiment_role="final"` 的 run 在 summary.json 中携带以下三个字段；
+它们由**恢复最佳 checkpoint 后的一次测试前向**同时导出，与 `test_loss` /
+`test_accuracy` 严格同源。
+
+### 字段定义
+
+* `test_confusion_matrix`：C×C 整数二维数组（C = `config.network.output_dim`，
+  且 ≥ 2）。**行 = 真实类别，列 = 预测类别**；`matrix[i][j]` 表示真实类别为 i、
+  预测类别为 j 的样本数。元素为非负整数，矩阵总数等于 `sample_counts.test`。
+* `test_per_class_metrics`：恰有 C 个对象（按类别 0..C-1 排序），每类含
+  `precision`、`recall`、`f1`（[0,1] 内有限数值）与 `support`（非负整数，等于
+  混淆矩阵对应**行和**）。**零分母规则**：某类预测正例数为 0 时 precision 记
+  0.0；真实 support 为 0 时 recall 记 0.0；precision+recall 为 0 时 f1 记 0.0。
+* `test_macro_avg`：`precision`/`recall`/`f1` 各为 C 类逐类指标的**不加权算术
+  平均**（不按 support 加权、不剔除零 support 类别），汇总器按容差 1e-9 与逐类
+  直接重算值核对。
+
+单 run 一致性约束（违反任一条即 invalid）：`sum(matrix) == sample_counts.test`；
+`sum(diagonal(matrix)) / sum(matrix)` 与 `test_accuracy` 在 1e-9 容差内一致；
+逐类 `support` 与矩阵行和逐类相等；`test_macro_avg` 与逐类重算值一致。
+
+### 汇总器行为
+
+* **校验**：final 记录缺任一字段、矩阵非方形/维度与 `output_dim` 不符/含浮点
+  或负数元素/support 与行和不符/macro 与重算不符/总数与 `sample_counts.test`
+  不符/对角线占比与 `test_accuracy` 不符 → 该 run 判 `invalid` 并附定位诊断。
+* **保留**：`runs.json` 原样保留每个 final run 的三个字段；`runs.csv` 以
+  `test_confusion_matrix_json` / `test_per_class_metrics_json` /
+  `test_macro_avg_json` 三列写入紧凑规范化 JSON（非 Python repr）；非 final
+  run 的这三列为空单元格。
+* **组级统计**：final 组（`test_evaluation="executed"`）的 `stats` 额外包含
+  `test_macro_avg` 与 `test_per_class_metrics`（键为类别索引字符串），每项给出
+  `mean`/`std`（ddof=0）/`n`；并附 `test_classification_note` 说明口径。
+  **语义注记**：组级统计是固定测试集上的**逐模型统计**——每个成员的 support
+  是该模型对同一批固定测试样本的类别计数，跨 seed 相加不构成独立样本数；
+  **混淆矩阵保留在 run 级，不做跨 seed 矩阵求和**（组级不输出任何"求和矩阵"）。
+* **兼容性**：baseline/exploration/legacy 记录不要求这些字段；`runs.csv` 新列
+  对旧记录为空单元格；缺字段的旧产物不会被误判为损坏。
 
 ## 测试集隔离纪律
 
@@ -111,7 +153,9 @@ null、类型错误或越界数值都会写入**定位到字段**的诊断并判
 `early_stopping`、`patience`、`min_delta`、`l2_lambda`、`network`（含结构与激活函数）、
 `model_seed`、`split_seed`、`history_rows`、`best_epoch`、`best_validation_loss`、
 `best_validation_accuracy`、`stop_reason`、`epochs_completed`、`total_seconds`、
-`test_loss`、`test_accuracy`、`diagnostics`（诊断字符串数组）、`config`（完整原始配置）。
+`test_loss`、`test_accuracy`、`test_confusion_matrix`、`test_per_class_metrics`、
+`test_macro_avg`（后三者仅 final run 非空）、`diagnostics`（诊断字符串数组）、
+`config`（完整原始配置）。
 
 CSV 与 JSON 字段一一对应；CSV 中 None 写作空单元格、bool 写作 true/false、
 嵌套结构写作紧凑规范化 JSON 字符串。**CSV 空单元格表示 null/缺失，权威取值以
@@ -144,5 +188,6 @@ learning_rate、scheduler、early_stopping、patience、min_delta、l2_lambda �
 ## 本工具不做什么
 
 不训练、不评估测试集、不选择模型或超参数、不生成图表（matplotlib 等作图
-依赖需后续单独批准）、不实现混淆矩阵或每类指标（P5.3/P5.4 范围）、不读取
-`best_model.npz`、不修改任何源 run 文件。
+依赖需后续单独批准）、不读取 `best_model.npz`、不修改任何源 run 文件。
+（final run 的分类指标自 P5.3-E6-A 起由训练器在 summary 中产出，汇总器负责
+校验、保留与组级统计，见上文"final run 分类指标"一节。）

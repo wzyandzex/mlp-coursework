@@ -77,6 +77,9 @@ RUN_CSV_FIELDS = (
     "total_seconds",
     "test_loss",
     "test_accuracy",
+    "test_confusion_matrix_json",
+    "test_per_class_metrics_json",
+    "test_macro_avg_json",
     "diagnostics_json",
     "config_json",
 )
@@ -283,6 +286,10 @@ def _fill_fields(record: dict, config: dict | None, summary: dict | None) -> Non
                     "stop_reason", "epochs_completed", "total_seconds",
                     "test_loss", "test_accuracy"):
             record[key] = _sanitize_json_value(summary.get(key))
+        # final run 的分类指标字段：非 final run 上这些键不存在，保持 None
+        for key in ("test_confusion_matrix", "test_per_class_metrics", "test_macro_avg"):
+            if key in summary:
+                record[key] = _sanitize_json_value(summary.get(key))
         if record["experiment_role"] is None:
             record["experiment_role"] = summary.get("experiment_role")
 
@@ -472,6 +479,192 @@ def _validate_summary_schema(summary: dict, diagnostics: list) -> bool:
     return ok
 
 
+_FINAL_METRIC_KEYS = ("precision", "recall", "f1")
+
+
+def _validate_final_classification_metrics(summary: dict, config: dict, diagnostics: list) -> bool:
+    """final run 必备分类指标字段的结构、范围与跨字段一致性校验。
+
+    仅在 experiment_role == "final" 时调用；baseline/exploration/legacy 不
+    要求这些字段，缺少它们不构成错误。校验内容：
+
+    * test_confusion_matrix：方形二维数组、元素为非负整数、维度 >= 2 且等于
+      config.network.output_dim；
+    * test_per_class_metrics：每类一个对象，precision/recall/f1 为 [0,1] 内
+      有限数值，support 为非负整数且等于混淆矩阵对应行和；
+    * test_macro_avg：precision/recall/f1 为 [0,1] 内有限数值，且与逐类指标
+      的不加权算术平均在容差内一致；
+    * 矩阵总数 == sample_counts.test；对角线占比与 test_accuracy 在容差内
+      一致（同一 checkpoint、同一批预测的必然结果）。
+    """
+    ok = True
+    for name in ("test_confusion_matrix", "test_per_class_metrics", "test_macro_avg"):
+        if name not in summary:
+            diagnostics.append(f"final summary missing required field {name!r}")
+            ok = False
+
+    matrix = summary.get("test_confusion_matrix")
+    num_classes = None
+    network = config.get("network") if isinstance(config, dict) else None
+    if isinstance(network, dict):
+        dim = network.get("output_dim")
+        if isinstance(dim, int) and not isinstance(dim, bool):
+            num_classes = dim
+    if not isinstance(matrix, list) or not matrix or not all(isinstance(row, list) for row in matrix):
+        diagnostics.append(
+            f"final summary 'test_confusion_matrix' must be a 2-D array of integers, "
+            f"got {matrix!r}"
+        )
+        matrix = None
+        ok = False
+    elif any(len(row) != len(matrix) for row in matrix):
+        diagnostics.append(
+            f"final summary 'test_confusion_matrix' must be square, got row widths "
+            f"{sorted({len(row) for row in matrix})}"
+        )
+        matrix = None
+        ok = False
+    else:
+        size = len(matrix)
+        if size < 2:
+            diagnostics.append(
+                f"final summary 'test_confusion_matrix' must cover at least 2 classes, got {size}"
+            )
+            matrix = None
+            ok = False
+        elif num_classes is not None and size != num_classes:
+            diagnostics.append(
+                f"final summary 'test_confusion_matrix' has {size} classes but "
+                f"config.network.output_dim is {num_classes}"
+            )
+            matrix = None
+            ok = False
+        else:
+            for i, row in enumerate(matrix):
+                for j, value in enumerate(row):
+                    if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+                        diagnostics.append(
+                            f"final summary 'test_confusion_matrix'[{i}][{j}] must be a "
+                            f"non-negative integer, got {value!r}"
+                        )
+                        matrix = None
+                        ok = False
+                        break
+                if matrix is None:
+                    break
+
+    total = None
+    row_sums = None
+    if matrix is not None:
+        size = len(matrix)
+        row_sums = [sum(row) for row in matrix]
+        total = sum(row_sums)
+        per_class = summary.get("test_per_class_metrics")
+        per_class_values = None
+        if not isinstance(per_class, list) or len(per_class) != size:
+            diagnostics.append(
+                f"final summary 'test_per_class_metrics' must be a list with exactly one "
+                f"entry per class ({size}), got {per_class!r}"
+            )
+            ok = False
+        else:
+            per_class_values = []
+            for cls, entry in enumerate(per_class):
+                if not isinstance(entry, dict):
+                    diagnostics.append(
+                        f"final summary 'test_per_class_metrics'[{cls}] must be an object, "
+                        f"got {entry!r}"
+                    )
+                    per_class_values = None
+                    ok = False
+                    break
+                entry_ok = True
+                for key in _FINAL_METRIC_KEYS:
+                    value = entry.get(key)
+                    if (isinstance(value, bool) or not isinstance(value, (int, float))
+                            or not math.isfinite(float(value))
+                            or not 0.0 <= float(value) <= 1.0):
+                        diagnostics.append(
+                            f"final summary 'test_per_class_metrics'[{cls}][{key!r}] must be "
+                            f"a finite number in [0, 1], got {value!r}"
+                        )
+                        entry_ok = False
+                        ok = False
+                support = entry.get("support")
+                if isinstance(support, bool) or not isinstance(support, int) or support < 0:
+                    diagnostics.append(
+                        f"final summary 'test_per_class_metrics'[{cls}]['support'] must be a "
+                        f"non-negative integer, got {support!r}"
+                    )
+                    entry_ok = False
+                    ok = False
+                elif support != row_sums[cls]:
+                    diagnostics.append(
+                        f"final summary 'test_per_class_metrics'[{cls}]['support'] "
+                        f"({support}) does not equal confusion matrix row sum "
+                        f"({row_sums[cls]})"
+                    )
+                    entry_ok = False
+                    ok = False
+                if entry_ok:
+                    per_class_values.append(
+                        {key: float(entry[key]) for key in _FINAL_METRIC_KEYS}
+                    )
+            if per_class_values is not None and len(per_class_values) != size:
+                per_class_values = None
+
+        macro = summary.get("test_macro_avg")
+        if not isinstance(macro, dict):
+            diagnostics.append(
+                f"final summary 'test_macro_avg' must be an object with precision/recall/f1, "
+                f"got {macro!r}"
+            )
+            ok = False
+        else:
+            macro_ok = True
+            for key in _FINAL_METRIC_KEYS:
+                value = macro.get(key)
+                if (isinstance(value, bool) or not isinstance(value, (int, float))
+                        or not math.isfinite(float(value))
+                        or not 0.0 <= float(value) <= 1.0):
+                    diagnostics.append(
+                        f"final summary 'test_macro_avg'[{key!r}] must be a finite number "
+                        f"in [0, 1], got {value!r}"
+                    )
+                    macro_ok = False
+                    ok = False
+            if macro_ok and per_class_values is not None:
+                for key in _FINAL_METRIC_KEYS:
+                    expected = sum(entry[key] for entry in per_class_values) / size
+                    if not math.isclose(float(macro[key]), expected, rel_tol=0.0, abs_tol=1e-9):
+                        diagnostics.append(
+                            f"final summary 'test_macro_avg'[{key!r}] ({macro[key]!r}) does "
+                            f"not match the unweighted per-class mean ({expected!r})"
+                        )
+                        ok = False
+
+        counts = summary.get("sample_counts")
+        test_count = counts.get("test") if isinstance(counts, dict) else None
+        if isinstance(test_count, int) and not isinstance(test_count, bool):
+            if total != test_count:
+                diagnostics.append(
+                    f"final summary confusion matrix total ({total}) does not match "
+                    f"sample_counts.test ({test_count})"
+                )
+                ok = False
+        accuracy = summary.get("test_accuracy")
+        diagonal = sum(matrix[i][i] for i in range(size))
+        if _is_finite_number(accuracy):
+            ratio = diagonal / total if total > 0 else 0.0
+            if not math.isclose(float(accuracy), ratio, rel_tol=0.0, abs_tol=1e-9):
+                diagnostics.append(
+                    f"final summary test_accuracy ({accuracy!r}) does not match the "
+                    f"confusion matrix diagonal ratio ({ratio!r})"
+                )
+                ok = False
+    return ok
+
+
 def _validate_current_schema(config: dict, summary: dict, diagnostics: list) -> bool:
     """P5.2-C 当前 schema 的完整校验：config + summary + 跨文件一致性。
 
@@ -538,6 +731,10 @@ def _validate_current_schema(config: dict, summary: dict, diagnostics: list) -> 
                 f"config.data.sample_counts {normalized_config!r}"
             )
             ok = False
+    # final run 必须携带完整且自洽的分类指标字段；baseline/exploration/legacy
+    # 不做此要求（缺字段是正常状态，不得判 invalid）
+    if summary.get("experiment_role") == "final":
+        ok = _validate_final_classification_metrics(summary, config, diagnostics) and ok
     return ok
 
 
@@ -596,6 +793,9 @@ def build_run_record(run_dir: Path, root: Path) -> dict:
         "total_seconds": None,
         "test_loss": None,
         "test_accuracy": None,
+        "test_confusion_matrix": None,
+        "test_per_class_metrics": None,
+        "test_macro_avg": None,
         "diagnostics": [],
         "config": None,
     }
@@ -755,12 +955,46 @@ def build_groups(success_records: list) -> list:
         if test_evaluation == "executed":
             for metric in ("test_loss", "test_accuracy"):
                 values = [member[metric] for member in members
-                          if isinstance(member.get(metric), (int, float))
-                          and not isinstance(member.get(metric), bool)]
+                          if isinstance(member[metric], (int, float))
+                          and not isinstance(member[metric], bool)]
                 entry = _mean_std(values)
                 if entry["n"] < len(members):
                     entry["reason"] = "some runs in this group have missing test metrics"
                 stats[metric] = entry
+            if members[0]["experiment_role"] == "final" and all(
+                    isinstance(m.get("test_macro_avg"), dict)
+                    and isinstance(m.get("test_per_class_metrics"), list)
+                    for m in members):
+                # final 组：Macro 与逐类 P/R/F1 的 mean/std(ddof=0)/n。
+                # 语义注记：这些是固定测试集上的逐模型统计——每个成员的
+                # support 是该模型对同一批固定测试样本的类别计数，跨 seed
+                # 的 support 不得相加后冒充独立样本数；混淆矩阵留在 run 级，
+                # 不做跨 seed 矩阵求和。
+                stats["test_classification_note"] = (
+                    "per-model statistics on the fixed test set; per-class support "
+                    "counts the same fixed test samples once per run and must not "
+                    "be summed across seeds as independent samples; confusion "
+                    "matrices are kept per-run in runs.json/runs.csv"
+                )
+                macro_keys = ("precision", "recall", "f1")
+                stats["test_macro_avg"] = {
+                    key: _mean_std([m["test_macro_avg"][key] for m in members])
+                    for key in macro_keys
+                }
+                network_config = group["group_config"].get("network") or {}
+                num_classes = network_config.get("output_dim")
+                if isinstance(num_classes, int) and all(
+                        len(m["test_per_class_metrics"]) == num_classes for m in members):
+                    stats["test_per_class_metrics"] = {
+                        str(cls): {
+                            key: _mean_std(
+                                [m["test_per_class_metrics"][cls][key] for m in members]
+                            ) for key in macro_keys
+                        } | {"support": _mean_std(
+                            [m["test_per_class_metrics"][cls]["support"] for m in members]
+                        )}
+                        for cls in range(num_classes)
+                    }
         else:
             reason = (
                 "test_evaluation is 'not_run' for this group; test metrics are "
@@ -822,10 +1056,16 @@ def _csv_value(value):
 
 def _run_csv_row(record: dict) -> dict:
     row = {key: _csv_value(record.get(key)) for key in RUN_CSV_FIELDS
-           if key not in ("network_json", "diagnostics_json", "config_json")}
+           if key not in ("network_json", "diagnostics_json", "config_json",
+                          "test_confusion_matrix_json", "test_per_class_metrics_json",
+                          "test_macro_avg_json")}
     row["network_json"] = _csv_value(record.get("network"))
     row["diagnostics_json"] = _csv_value(record.get("diagnostics"))
     row["config_json"] = _csv_value(record.get("config"))
+    # final run 的分类指标以紧凑规范化 JSON 保留；非 final run 为空单元格
+    row["test_confusion_matrix_json"] = _csv_value(record.get("test_confusion_matrix"))
+    row["test_per_class_metrics_json"] = _csv_value(record.get("test_per_class_metrics"))
+    row["test_macro_avg_json"] = _csv_value(record.get("test_macro_avg"))
     return row
 
 

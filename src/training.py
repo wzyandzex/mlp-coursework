@@ -25,6 +25,7 @@ checkpoint，val_loss 完全相同时保留更早的 epoch（扫描时用严格�
 
 import csv
 import json
+import math
 import platform
 import sys
 import time
@@ -78,6 +79,138 @@ def evaluate(model, X, y, batch_size: int = 1000) -> tuple:
         loss_sum += float(batch_loss) * (end - start)
         correct += int(np.sum(np.argmax(logits, axis=1) == y[start:end]))
     return loss_sum / total, correct / total
+
+
+def evaluate_with_predictions(model, X, y, batch_size: int = 1000) -> tuple:
+    """联合评估：同一次前向同时返回 (样本加权 loss, accuracy, 预测标签)。
+
+    与 evaluate() 完全相同的批处理、样本加权与比较规则；额外保留每个样本
+    的 argmax 预测（int64），供混淆矩阵等分类指标与 test_loss/test_accuracy
+    同源——final 评估不得对测试集做第二次前向。
+    """
+    X = np.asarray(X)
+    y = np.asarray(y)
+    if X.ndim != 2 or X.shape[0] == 0:
+        raise ValueError(f"X must be a non-empty 2-D array, got shape {X.shape}.")
+    if y.ndim != 1 or y.shape[0] != X.shape[0]:
+        raise ValueError(f"y must be 1-D with length {X.shape[0]}, got shape {y.shape}.")
+    if batch_size <= 0:
+        raise ValueError(f"batch_size must be positive, got {batch_size}.")
+
+    total = X.shape[0]
+    loss_sum = 0.0
+    correct = 0
+    predictions = np.empty(total, dtype=np.int64)
+    for start in range(0, total, batch_size):
+        end = min(start + batch_size, total)
+        logits = model.forward(X[start:end])
+        batch_loss, _ = softmax_cross_entropy(logits, y[start:end])
+        loss_sum += float(batch_loss) * (end - start)
+        batch_pred = np.argmax(logits, axis=1)
+        predictions[start:end] = batch_pred
+        correct += int(np.sum(batch_pred == y[start:end]))
+    return loss_sum / total, correct / total, predictions
+
+
+def confusion_matrix(y_true, y_pred, num_classes: int) -> "np.ndarray":
+    """固定类别顺序的整数混淆矩阵：行=真实类别，列=预测类别。
+
+    严格输入校验：标签必须是一维、等长、非空的整数数组（拒绝浮点/布尔等
+    dtype，绝不静默转换）；标签越界即报错；num_classes 为 >= 2 的整数。
+    """
+    if isinstance(num_classes, bool) or not isinstance(num_classes, (int, np.integer)):
+        raise ValueError(f"num_classes must be an integer, got {num_classes!r}.")
+    if num_classes < 2:
+        raise ValueError(f"num_classes must be >= 2, got {num_classes}.")
+    y_true_arr = np.asarray(y_true)
+    y_pred_arr = np.asarray(y_pred)
+    if y_true_arr.ndim != 1 or y_pred_arr.ndim != 1:
+        raise ValueError(
+            f"labels must be 1-D arrays, got shapes {y_true_arr.shape} / {y_pred_arr.shape}."
+        )
+    if y_true_arr.size == 0:
+        raise ValueError("labels must be non-empty.")
+    if y_true_arr.shape[0] != y_pred_arr.shape[0]:
+        raise ValueError(
+            f"y_true and y_pred must have the same length, got "
+            f"{y_true_arr.shape[0]} / {y_pred_arr.shape[0]}."
+        )
+    for name, arr in (("y_true", y_true_arr), ("y_pred", y_pred_arr)):
+        if arr.dtype.kind not in "iu":
+            raise ValueError(
+                f"{name} must be an integer-dtype array of class labels; got dtype "
+                f"{arr.dtype}. Floating-point labels are rejected instead of being "
+                f"silently cast to integers."
+            )
+        if arr.size and (int(arr.min()) < 0 or int(arr.max()) >= num_classes):
+            raise ValueError(
+                f"{name} contains labels outside [0, {num_classes - 1}]: "
+                f"min={int(arr.min())}, max={int(arr.max())}."
+            )
+    matrix = np.zeros((num_classes, num_classes), dtype=np.int64)
+    np.add.at(matrix, (y_true_arr, y_pred_arr), 1)
+    return matrix
+
+
+def per_class_metrics(confusion) -> list:
+    """从混淆矩阵计算每类 precision / recall / f1 / support（按类别 0..C-1 排序）。
+
+    零分母规则（预注册）：predicted 为 0 时 precision=0.0；support 为 0 时
+    recall=0.0；precision+recall 为 0 时 f1=0.0。所有输出有限且在 [0,1]。
+    """
+    arr = np.asarray(confusion)
+    if arr.ndim != 2 or arr.shape[0] != arr.shape[1]:
+        raise ValueError(f"confusion must be a square 2-D matrix, got shape {arr.shape}.")
+    if arr.shape[0] < 2:
+        raise ValueError(f"confusion must have at least 2 classes, got {arr.shape[0]}.")
+    if arr.dtype.kind not in "iu":
+        raise ValueError(
+            f"confusion must be an integer-dtype matrix; got dtype {arr.dtype}."
+        )
+    if arr.size and int(arr.min()) < 0:
+        raise ValueError("confusion counts must be non-negative.")
+    metrics = []
+    num_classes = arr.shape[0]
+    for cls in range(num_classes):
+        tp = int(arr[cls, cls])
+        support = int(arr[cls, :].sum())
+        predicted = int(arr[:, cls].sum())
+        precision = tp / predicted if predicted > 0 else 0.0
+        recall = tp / support if support > 0 else 0.0
+        f1 = (
+            2.0 * precision * recall / (precision + recall)
+            if (precision + recall) > 0
+            else 0.0
+        )
+        metrics.append(
+            {"precision": float(precision), "recall": float(recall),
+             "f1": float(f1), "support": support}
+        )
+    return metrics
+
+
+def macro_average(per_class: list) -> dict:
+    """全部类别逐类指标的不加权算术平均（不按 support 加权、不剔除任何类别）。"""
+    if not isinstance(per_class, list) or len(per_class) == 0:
+        raise ValueError("per_class must be a non-empty list of per-class metric dicts.")
+    keys = ("precision", "recall", "f1")
+    for index, entry in enumerate(per_class):
+        if not isinstance(entry, dict):
+            raise ValueError(f"per_class[{index}] must be a dict, got {entry!r}.")
+        for key in keys:
+            value = entry.get(key)
+            if isinstance(value, bool) or not isinstance(value, (int, float)):
+                raise ValueError(
+                    f"per_class[{index}][{key!r}] must be a number, got {value!r}."
+                )
+            if not math.isfinite(float(value)):
+                raise ValueError(f"per_class[{index}][{key!r}] must be finite.")
+            if not 0.0 <= float(value) <= 1.0:
+                raise ValueError(
+                    f"per_class[{index}][{key!r}] must be within [0, 1], got {value!r}."
+                )
+    return {key: float(sum(float(entry[key]) for entry in per_class) / len(per_class))
+            for key in keys}
 
 
 def _iterate_minibatches(n_samples: int, batch_size: int, rng: np.random.Generator):
@@ -626,7 +759,18 @@ def run_experiment(
         # 最佳 epoch 参数，保证测试指标与 best_model.npz 是同一组参数。
         # 探索路径（evaluate_test=False）完全不进入此分支。
         model.set_params(result.best_params)
-        test_loss, test_accuracy = evaluate(model, test_images, test_labels)
+        if experiment_role == "final":
+            # final 联合评估：test_loss/test_accuracy/预测标签来自同一次前向，
+            # 混淆矩阵、逐类指标与 Macro Average 与之严格同源。
+            test_loss, test_accuracy, test_predictions = evaluate_with_predictions(
+                model, test_images, test_labels
+            )
+            num_classes = int(network["output_dim"])
+            matrix = confusion_matrix(test_labels, test_predictions, num_classes)
+            per_class = per_class_metrics(matrix)
+            macro = macro_average(per_class)
+        else:
+            test_loss, test_accuracy = evaluate(model, test_images, test_labels)
         test_evaluation = "executed"
     else:
         # 未评估的指标必须是 JSON null，绝不能写成 0 或伪造数值
@@ -651,6 +795,12 @@ def run_experiment(
         "epochs_completed": len(result.history),
         "total_seconds": result.total_seconds,
     }
+    if experiment_role == "final":
+        # 仅 final run 携带分类指标字段；baseline/exploration 的既有 summary
+        # schema 保持不变（旧产物缺这些字段是正常状态，不是损坏）。
+        summary["test_confusion_matrix"] = matrix.tolist()
+        summary["test_per_class_metrics"] = per_class
+        summary["test_macro_avg"] = macro
     with open(run_dir / "summary.json", "w", encoding="utf-8") as handle:
         json.dump(summary, handle, indent=2, ensure_ascii=False)
     return summary

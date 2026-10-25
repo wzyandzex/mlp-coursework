@@ -1439,3 +1439,171 @@ def test_cli_hidden_activation_default_path_unchanged(tmp_path):
     assert config["network"]["hidden_activation"] == "relu"
     assert config["network"]["hidden_dims"] == [128]
 
+
+# ---------------------------------------------------------------------------
+# P5.3-E6-A 新增：分类指标函数与 final 联合评估。
+# 全部使用合成数据与临时目录，不读取真实 MNIST，不联网。
+# ---------------------------------------------------------------------------
+
+from src.training import (  # noqa: E402
+    confusion_matrix,
+    evaluate_with_predictions,
+    macro_average,
+    per_class_metrics,
+)
+
+
+def test_confusion_matrix_hand_computed():
+    """手算混淆矩阵：行=真实类别，列=预测类别。"""
+    y_true = np.array([0, 0, 1, 1, 2, 2, 2])
+    y_pred = np.array([0, 1, 1, 1, 2, 0, 2])
+    matrix = confusion_matrix(y_true, y_pred, num_classes=3)
+    assert matrix.tolist() == [[1, 1, 0], [0, 2, 0], [1, 0, 2]]
+    assert matrix.dtype.kind in "iu"
+
+
+def test_per_class_metrics_hand_computed():
+    """手算逐类 TP / precision / recall / F1 / support。"""
+    matrix = np.array([[1, 1, 0], [0, 2, 0], [1, 0, 2]])
+    metrics = per_class_metrics(matrix)
+    assert [m["support"] for m in metrics] == [2, 2, 3]
+    assert metrics[0]["precision"] == pytest.approx(0.5)    # 1/2
+    assert metrics[1]["precision"] == pytest.approx(2 / 3)  # 2/3
+    assert metrics[2]["precision"] == pytest.approx(1.0)    # 2/2
+    assert metrics[0]["recall"] == pytest.approx(0.5)       # 1/2
+    assert metrics[1]["recall"] == pytest.approx(1.0)       # 2/2
+    assert metrics[2]["recall"] == pytest.approx(2 / 3)     # 2/3
+    assert metrics[0]["f1"] == pytest.approx(0.5)
+    assert metrics[1]["f1"] == pytest.approx(0.8)           # 2*(2/3)*1/(2/3+1)
+    assert metrics[2]["f1"] == pytest.approx(0.8)
+
+
+def test_zero_predicted_precision_and_zero_support_recall_are_zero():
+    """零分母规则：类别 1 既无真实样本（support=0）也从未被预测（predicted=0）。"""
+    matrix = np.array([[5, 0], [0, 0]])
+    metrics = per_class_metrics(matrix)
+    assert metrics[1]["support"] == 0
+    assert metrics[1]["precision"] == 0.0  # 分母 predicted=0 → 0.0
+    assert metrics[1]["recall"] == 0.0     # 分母 support=0 → 0.0
+    assert metrics[1]["f1"] == 0.0         # P+R=0 → 0.0
+
+
+def test_macro_average_is_unweighted():
+    """Macro 是不加权平均：support 严重不均衡时与 support 加权结果不同。"""
+    matrix = np.array([[8, 2], [0, 0]])
+    metrics = per_class_metrics(matrix)
+    macro = macro_average(metrics)
+    # class0: TP=8, predicted=8, support=10 → precision=1.0, recall=0.8, f1=8/9；class1 全 0
+    assert macro["precision"] == pytest.approx(0.5)   # (1.0 + 0) / 2，而非 support 加权的 1.0
+    assert macro["recall"] == pytest.approx(0.4)      # (0.8 + 0) / 2，而非 support 加权的 0.8
+    assert macro["f1"] == pytest.approx(4 / 9)        # (8/9 + 0) / 2
+
+
+@pytest.mark.parametrize(
+    "y_true, y_pred, num_classes",
+    [
+        (np.array([0, 1]), np.array([0]), 2),          # 长度不符
+        (np.array([]), np.array([]), 2),               # 空输入
+        (np.array([0.0, 1.0]), np.array([0, 1]), 2),   # 浮点标签（数值为整数也不得静默转换）
+        (np.array([0, 1.7]), np.array([0, 0]), 2),     # 非整数浮点标签
+        (np.array([0, 2]), np.array([0, 0]), 2),       # 越界标签
+        (np.array([0, -1]), np.array([0, 0]), 2),      # 负标签
+        (np.array([0, 1]), np.array([0, 0]), 0),       # 非法类别数 0
+        (np.array([0, 1]), np.array([0, 0]), 1),       # 类别数 1
+        (np.array([0, 1]), np.array([0, 0]), 1.5),     # 非整数类别数
+        (np.array([0, 1]), np.array([0, 0]), True),    # 布尔冒充类别数
+        (np.array([[0], [1]]), np.array([0, 0]), 2),   # 非一维
+    ],
+)
+def test_confusion_matrix_rejects_invalid_inputs(y_true, y_pred, num_classes):
+    with pytest.raises(ValueError):
+        confusion_matrix(y_true, y_pred, num_classes)
+
+
+@pytest.mark.parametrize(
+    "matrix",
+    [
+        np.array([[1.0, 0.0], [0.0, 1.0]]),   # 浮点矩阵
+        np.array([[1, -1], [0, 2]]),          # 负计数
+        np.array([[5]]),                      # 单类别
+        np.array([[1, 2]]),                   # 非方形
+        np.array([[1, 2, 3], [4, 5, 6]]),     # 非方形（3×2）
+    ],
+)
+def test_per_class_metrics_rejects_invalid_matrices(matrix):
+    with pytest.raises(ValueError):
+        per_class_metrics(matrix)
+
+
+def test_evaluate_with_predictions_matches_evaluate():
+    """联合评估与 evaluate() 同批同权：loss/accuracy 逐位一致，预测可供混淆矩阵。"""
+    X, y, tr, va, te = _tiny_split()
+    model = MLP(2, [8], 3, hidden_activation="tanh", seed=0)
+    loss_a, acc_a = evaluate(model, X[te], y[te])
+    loss_b, acc_b, preds = evaluate_with_predictions(model, X[te], y[te])
+    assert loss_b == loss_a and acc_b == acc_a
+    assert preds.dtype.kind in "iu" and preds.shape == (len(te),)
+    matrix = confusion_matrix(y[te], preds, num_classes=3)
+    assert int(np.trace(matrix)) / len(te) == acc_b  # 同一次前向的必然一致性
+
+
+def test_final_run_summary_contains_classification_metrics(tmp_path):
+    """final run 端到端：三字段齐全且与 test 指标/样本数严格自洽，summary 严格 JSON。"""
+    X, y, tr, va, te = _tiny_split()
+    summary = run_experiment(
+        train_images=X[tr], train_labels=y[tr],
+        val_images=X[va], val_labels=y[va],
+        test_images=X[te], test_labels=y[te],
+        config=_tiny_config(), output_root=tmp_path, run_name="final_run",
+        evaluate_test=True, experiment_role="final",
+    )
+    matrix = summary["test_confusion_matrix"]
+    per_class = summary["test_per_class_metrics"]
+    macro = summary["test_macro_avg"]
+    assert summary["experiment_role"] == "final"
+    assert summary["test_evaluation"] == "executed"
+    assert isinstance(summary["test_loss"], float)
+    assert len(matrix) == 3 and all(len(row) == 3 for row in matrix)
+    total = sum(sum(row) for row in matrix)
+    assert total == summary["sample_counts"]["test"] == len(te)
+    diagonal = sum(matrix[i][i] for i in range(3))
+    assert diagonal / total == pytest.approx(summary["test_accuracy"])
+    assert len(per_class) == 3
+    for cls, entry in enumerate(per_class):
+        assert entry["support"] == sum(matrix[cls])
+        assert 0.0 <= entry["precision"] <= 1.0
+        assert 0.0 <= entry["recall"] <= 1.0
+        assert 0.0 <= entry["f1"] <= 1.0
+    for key in ("precision", "recall", "f1"):
+        assert macro[key] == pytest.approx(sum(e[key] for e in per_class) / 3)
+    raw = (tmp_path / "final_run" / "summary.json").read_text(encoding="utf-8")
+    saved = json.loads(raw)  # 严格 JSON 可读（无 NaN/Infinity）
+    assert saved["test_confusion_matrix"] == matrix
+    assert saved["test_per_class_metrics"] == per_class
+    assert saved["test_macro_avg"] == macro
+
+
+def test_non_final_runs_have_no_classification_fields(tmp_path):
+    """exploration/baseline 语义不变：不携带新字段；exploration test 仍为 null。"""
+    X, y, tr, va, te = _tiny_split()
+    s_exp = run_experiment(
+        train_images=X[tr], train_labels=y[tr],
+        val_images=X[va], val_labels=y[va],
+        test_images=X[te], test_labels=y[te],
+        config=_tiny_config(), output_root=tmp_path, run_name="exp",
+        evaluate_test=False, experiment_role="exploration",
+    )
+    for key in ("test_confusion_matrix", "test_per_class_metrics", "test_macro_avg"):
+        assert key not in s_exp
+    assert s_exp["test_loss"] is None and s_exp["test_accuracy"] is None
+    s_base = run_experiment(
+        train_images=X[tr], train_labels=y[tr],
+        val_images=X[va], val_labels=y[va],
+        test_images=X[te], test_labels=y[te],
+        config=_tiny_config(), output_root=tmp_path, run_name="base",
+        evaluate_test=True, experiment_role="baseline",
+    )
+    for key in ("test_confusion_matrix", "test_per_class_metrics", "test_macro_avg"):
+        assert key not in s_base
+    assert isinstance(s_base["test_loss"], float)
+

@@ -904,3 +904,142 @@ def test_three_final_runs_group_stats(tmp_path):
     )
     assert stats["test_per_class_metrics"]["0"]["support"] == {"mean": 90.0, "std": 0.0, "n": 3}
     assert stats["test_per_class_metrics"]["1"]["support"] == {"mean": 10.0, "std": 0.0, "n": 3}
+
+
+# ---------------------------------------------------------------------------
+# P5.3-E6-A-R1 新增：逐类 P/R/F1 必须与混淆矩阵重算值逐项一致。
+# 冻结公式：tp=M[c][c]；support=行和；predicted=列和；predicted=0 → precision=0.0；
+# support=0 → recall=0.0；P+R=0 → f1=0.0。容差 abs 1e-9、rel_tol=0.0。
+# ---------------------------------------------------------------------------
+
+
+def _tampered_final_summary(key, cls, wrong_value):
+    """构造"仅某一类某个指标被篡改、macro 同步调整"的 final summary。
+
+    混淆矩阵、support、总数、accuracy 与其它逐类值全部保持合法——证明校验
+    捕获的是"逐类值与矩阵不符"，而非范围/macro 等既有检查。
+    """
+    matrix = _final_matrix()
+    fields = _final_metrics_fields(matrix)
+    per_class = [dict(entry) for entry in fields["test_per_class_metrics"]]
+    assert wrong_value != per_class[cls][key]  # 篡改值必须确实偏离矩阵重算值
+    per_class[cls][key] = wrong_value
+    fields["test_per_class_metrics"] = per_class
+    # 同步调整 macro，使其仍是篡改后逐类值的不加权平均
+    fields["test_macro_avg"] = {
+        k: sum(e[k] for e in per_class) / len(per_class)
+        for k in ("precision", "recall", "f1")
+    }
+    return {**_make_summary(experiment_role="final", test_evaluation="executed"), **fields}
+
+
+@pytest.mark.parametrize("key", ("precision", "recall", "f1"))
+@pytest.mark.parametrize("cls", (0, 1))
+def test_final_per_class_metrics_must_match_matrix(tmp_path, key, cls):
+    """篡改某类 P/R/F1（范围内）并同步修正 macro → 仍必须判 invalid。"""
+    root = tmp_path / "outputs"
+    config = _make_config(experiment_role="final", evaluate_test=True, model_seed=404)
+    summary = _tampered_final_summary(key, cls, 0.5)
+    _write_run(root, "final_tampered", config=config, summary=summary)
+    report = aggregate(root=root, output=root / "_aggregate", strict=True)
+    assert report["counts"]["invalid"] == 1
+    runs = _read_json(root / "_aggregate" / "runs.json")["runs"]
+    assert runs[0]["status"] == "invalid"
+    assert any(
+        f"'test_per_class_metrics'[{cls}]" in d and f"{key!r}" in d
+        and "recomputed from the confusion matrix" in d
+        for d in runs[0]["diagnostics"]
+    ), runs[0]["diagnostics"]
+
+
+def test_zero_denominator_rules_consistent_with_matrix(tmp_path):
+    """predicted=0 / support=0（含 predicted>0 组合）时冻结零分母值应通过。"""
+    root = tmp_path / "outputs"
+    # class1：support=0、predicted=0、tp=0 → p=r=f=0.0
+    _make_final_run(root, "zd_never", model_seed=404, matrix=[[5, 0], [0, 0]], test_loss=0.2)
+    # class1：support=0 但 predicted=3（列和来自 class0 的错分）→ p=r=f=0.0
+    _make_final_run(root, "zd_no_support", model_seed=505, matrix=[[5, 3], [0, 0]],
+                    test_loss=0.3)
+    report = aggregate(root=root, output=root / "_aggregate", strict=True)
+    assert report["counts"] == {"success": 2, "incomplete": 0, "invalid": 0, "legacy": 0}
+    runs = {r["run_name"]: r for r in _read_json(root / "_aggregate" / "runs.json")["runs"]}
+    for name in ("zd_never", "zd_no_support"):
+        assert runs[name]["status"] == "success"
+        assert runs[name]["test_per_class_metrics"][1]["precision"] == 0.0
+        assert runs[name]["test_per_class_metrics"][1]["recall"] == 0.0
+        assert runs[name]["test_per_class_metrics"][1]["f1"] == 0.0
+
+
+@pytest.mark.parametrize(
+    "matrix, key, wrong_value",
+    [
+        ([[5, 0], [0, 0]], "precision", 0.5),  # predicted=0 → 正确值为 0.0
+        ([[5, 3], [0, 0]], "recall", 0.9),     # support=0 → 正确值为 0.0
+        ([[5, 0], [0, 0]], "f1", 0.4),         # P+R=0 → 正确值为 0.0
+    ],
+)
+def test_zero_denominator_violations_rejected(tmp_path, matrix, key, wrong_value):
+    """零分母类别写入非零指标（macro 同步）→ 与矩阵重算不符，判 invalid。"""
+    root = tmp_path / "outputs"
+    fields = _final_metrics_fields(matrix)
+    cls = 1
+    assert fields["test_per_class_metrics"][cls][key] == 0.0  # 冻结规则下的正确值
+    per_class = [dict(e) for e in fields["test_per_class_metrics"]]
+    per_class[cls][key] = wrong_value
+    fields["test_per_class_metrics"] = per_class
+    fields["test_macro_avg"] = {
+        k: sum(e[k] for e in per_class) / len(per_class)
+        for k in ("precision", "recall", "f1")
+    }
+    config = _make_config(experiment_role="final", evaluate_test=True, model_seed=404)
+    config["network"]["output_dim"] = len(matrix)
+    total = sum(sum(row) for row in matrix)
+    config["data"]["sample_counts"]["test"] = total
+    summary = {**_make_summary(experiment_role="final", test_evaluation="executed"), **fields}
+    summary["sample_counts"]["test"] = total
+    _write_run(root, "zd_bad", config=config, summary=summary)
+    report = aggregate(root=root, output=root / "_aggregate", strict=True)
+    assert report["counts"]["invalid"] == 1
+    runs = _read_json(root / "_aggregate" / "runs.json")["runs"]
+    assert any(
+        f"'test_per_class_metrics'[{cls}]" in d and f"{key!r}" in d
+        and "recomputed from the confusion matrix" in d
+        for d in runs[0]["diagnostics"]
+    ), runs[0]["diagnostics"]
+
+
+def test_final_per_class_inconsistency_default_vs_strict(tmp_path, capsys):
+    """默认模式保留诊断并标 invalid；--strict 退出码非零。"""
+    root = tmp_path / "outputs"
+    config = _make_config(experiment_role="final", evaluate_test=True, model_seed=404)
+    summary = _tampered_final_summary("precision", 0, 0.5)
+    _write_run(root, "final_tampered", config=config, summary=summary)
+    # 默认模式：退出码 0、诊断保留、状态 invalid
+    report_default = aggregate(root=root, output=root / "_agg_default")
+    assert report_default["counts"]["invalid"] == 1
+    assert report_default["strict_failed"] is False
+    runs = _read_json(root / "_agg_default" / "runs.json")["runs"]
+    assert runs[0]["status"] == "invalid"
+    assert any("recomputed from the confusion matrix" in d for d in runs[0]["diagnostics"])
+    # --strict：strict_failed=True 且 CLI 非零退出
+    report_strict = aggregate(root=root, output=root / "_agg_strict", strict=True)
+    assert report_strict["strict_failed"] is True
+    assert main(["aggregate", "--root", str(root),
+                 "--output", str(root / "_agg_cli"), "--strict"]) == 1
+
+
+def test_metric_consistency_fix_not_extended_to_non_final(tmp_path):
+    """修复不得扩展到旧记录：exploration 携带（即便不一致的）额外字段仍按既有 schema 处理。"""
+    root = tmp_path / "outputs"
+    summary = _make_summary()
+    summary["test_confusion_matrix"] = [[1, 0], [0, 1]]
+    summary["test_per_class_metrics"] = [
+        {"precision": 0.1, "recall": 0.2, "f1": 0.3, "support": 1},
+        {"precision": 0.4, "recall": 0.5, "f1": 0.6, "support": 1},
+    ]
+    summary["test_macro_avg"] = {"precision": 0.7, "recall": 0.8, "f1": 0.9}
+    _write_run(root, "exp_extra", config=_make_config(), summary=summary)
+    report = aggregate(root=root, output=root / "_aggregate", strict=True)
+    assert report["counts"]["success"] == 1
+    runs = _read_json(root / "_aggregate" / "runs.json")["runs"]
+    assert runs[0]["status"] == "success" and runs[0]["experiment_role"] == "exploration"

@@ -643,6 +643,34 @@ def _validate_final_classification_metrics(summary: dict, config: dict, diagnost
                         )
                         ok = False
 
+        if per_class_values is not None:
+            # 冻结规则：逐类 precision/recall/f1 必须与混淆矩阵本身的重算值逐项
+            # 一致（权威来源是矩阵，不是 summary 内部数值；否则同步篡改逐类值与
+            # macro 可绕过校验）。零分母规则：predicted=0 → precision=0.0；
+            # support=0 → recall=0.0；P+R=0 → f1=0.0。容差 abs 1e-9、rel_tol=0。
+            for cls in range(size):
+                tp = matrix[cls][cls]
+                support = row_sums[cls]
+                predicted = sum(matrix[row][cls] for row in range(size))
+                precision = tp / predicted if predicted > 0 else 0.0
+                recall = tp / support if support > 0 else 0.0
+                f1 = (
+                    2.0 * precision * recall / (precision + recall)
+                    if (precision + recall) > 0
+                    else 0.0
+                )
+                expected = {"precision": precision, "recall": recall, "f1": f1}
+                for key in _FINAL_METRIC_KEYS:
+                    value = per_class_values[cls][key]
+                    if not math.isclose(value, expected[key], rel_tol=0.0, abs_tol=1e-9):
+                        diagnostics.append(
+                            f"final summary 'test_per_class_metrics'[{cls}][{key!r}] "
+                            f"({summary['test_per_class_metrics'][cls][key]!r}) does not "
+                            f"match the value recomputed from the confusion matrix "
+                            f"({expected[key]!r})"
+                        )
+                        ok = False
+
         counts = summary.get("sample_counts")
         test_count = counts.get("test") if isinstance(counts, dict) else None
         if isinstance(test_count, int) and not isinstance(test_count, bool):

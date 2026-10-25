@@ -110,7 +110,12 @@ null、类型错误或越界数值都会写入**定位到字段**的诊断并判
 
 单 run 一致性约束（违反任一条即 invalid）：`sum(matrix) == sample_counts.test`；
 `sum(diagonal(matrix)) / sum(matrix)` 与 `test_accuracy` 在 1e-9 容差内一致；
-逐类 `support` 与矩阵行和逐类相等；`test_macro_avg` 与逐类重算值一致。
+逐类 `support` 与矩阵行和逐类相等；`test_macro_avg` 与逐类重算值一致；
+**逐类 `precision`/`recall`/`f1` 必须与混淆矩阵按冻结公式重算的值逐项一致**
+（`tp = matrix[c][c]`，`support` = 行和，`predicted` = 列和；`predicted=0` 时
+precision 记 0.0，`support=0` 时 recall 记 0.0，`precision+recall=0` 时 f1 记
+0.0；容差 abs 1e-9、rel_tol=0.0。权威来源是混淆矩阵本身——同步篡改逐类值
+与 macro 无法通过校验）。
 
 ### 汇总器行为
 

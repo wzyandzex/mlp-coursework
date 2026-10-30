@@ -1,0 +1,10 @@
+run_name,optimizer,learning_rate,model_seed,split_seed,best_validation_loss,best_validation_accuracy,total_seconds,is_a0_pilot,source_path
+E1_adam_lr0p0003_seed42,adam,0.0003,42,2026,0.12015567030606855,0.9646,21.49077999999281,False,outputs/p5.3/E1_exploration/E1_adam_lr0p0003_seed42/summary.json
+E1_adam_lr0p001_seed42,adam,0.001,42,2026,0.1036929215363466,0.9716,21.859884899982717,False,outputs/p5.3/E1_exploration/E1_adam_lr0p001_seed42/summary.json
+E1_adam_lr0p003_seed42,adam,0.003,42,2026,0.1024391490873419,0.9684,28.399283899983857,False,outputs/p5.3/E1_exploration/E1_adam_lr0p003_seed42/summary.json
+E1_momentum_sgd_lr0p01_seed42,momentum_sgd,0.01,42,2026,0.12474486206904926,0.9602,14.602279699989595,False,outputs/p5.3/E1_exploration/E1_momentum_sgd_lr0p01_seed42/summary.json
+E1_momentum_sgd_lr0p03_seed42,momentum_sgd,0.03,42,2026,0.10366797039836802,0.968,15.134963099990273,False,outputs/p5.3/E1_exploration/E1_momentum_sgd_lr0p03_seed42/summary.json
+E1_momentum_sgd_lr0p05_seed42,momentum_sgd,0.05,42,2026,0.10098516826554745,0.9698,13.806358600006206,False,outputs/p5.3/E1_exploration/E1_momentum_sgd_lr0p05_seed42/summary.json
+E1_sgd_lr0p05_seed42,sgd,0.05,42,2026,0.16478589695420962,0.9494,14.455326299997978,True,outputs/p5.3/E1_exploration/E1_sgd_lr0p05_seed42/summary.json
+E1_sgd_lr0p1_seed42,sgd,0.1,42,2026,0.12540573886253945,0.9576,14.629223299998557,False,outputs/p5.3/E1_exploration/E1_sgd_lr0p1_seed42/summary.json
+E1_sgd_lr0p2_seed42,sgd,0.2,42,2026,0.10266570055078464,0.966,12.530781899986323,False,outputs/p5.3/E1_exploration/E1_sgd_lr0p2_seed42/summary.json

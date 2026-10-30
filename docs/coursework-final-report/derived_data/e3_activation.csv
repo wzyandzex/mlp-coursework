@@ -1,0 +1,10 @@
+run_name,hidden_activation,auto_initializer,model_seed,best_validation_loss,best_validation_accuracy
+relu_seed101,relu,He normal,101,0.09479243688333672,0.9708
+relu_seed202,relu,He normal,202,0.10544455566332163,0.968
+relu_seed303,relu,He normal,303,0.10423197669769099,0.9728
+sigmoid_seed101,sigmoid,Xavier normal,101,0.13933405827397183,0.9582
+sigmoid_seed202,sigmoid,Xavier normal,202,0.1356414008126219,0.9584
+sigmoid_seed303,sigmoid,Xavier normal,303,0.13415538330118154,0.9596
+tanh_seed101,tanh,Xavier normal,101,0.10802631651407983,0.9674
+tanh_seed202,tanh,Xavier normal,202,0.10939029117921464,0.9674
+tanh_seed303,tanh,Xavier normal,303,0.1015827733743663,0.971

@@ -1,20 +1,34 @@
-# 手写 MLP 课程作业 —— 阶段 4：MNIST 数据管线与正式训练闭环（P4-DATA-TRAIN-01）
+# 手写 MLP 课程作业 —— MNIST 训练闭环、对照实验链与最终报告（P4–P6）
 
 ## 当前阶段与模块职责
 
-在阶段 3 的手写 NumPy 核心（P3-CORE-01 已关闭）之上，建立了可复现、可验证、可保存结果的
-MNIST 基础训练闭环。
+在阶段 3 的手写 NumPy 核心（P3-CORE-01 已关闭）与阶段 4 的 MNIST 训练闭环之上，P5.3 按
+预注册流程完成了对照实验链 E0–E6，P6 生成最终课程报告与图表（交付包见
+`docs/coursework-final-report/`）。
 
 | 模块 | 职责 |
 | --- | --- |
 | `src/activations.py` | **（阶段 3，本阶段未改动）** ReLU/Sigmoid/Tanh 及导数、按名称解析；Sigmoid 数值稳定实现。 |
 | `src/losses.py` | **（阶段 3，本阶段未改动）** 稳定 Softmax 与 `softmax_cross_entropy`（log-sum-exp，批次平均梯度 `(P−Y)/m`）。 |
 | `src/mlp.py` | **（阶段 3，本阶段未改动）** MLP：He/Xavier 初始化、forward（含 cache）、backward、predict、参数备份/恢复。 |
-| `src/optimizers.py` | **（阶段 3，本阶段未改动）** 基础 SGD：两阶段更新（候选值有限性验证 + 原子就地提交）。 |
+| `src/optimizers.py` | SGD/MomentumSGD/Adam：两阶段更新（候选值有限性验证 + 原子就地提交）。 |
 | `src/mnist_data.py` | **（本阶段新增）** IDX gzip 解析（magic/维度/payload/标签范围校验）、显式下载（临时文件→结构校验→原子替换，双镜像）、预处理（float64/255 → (N,784)）、按比例分层随机切分。 |
-| `src/training.py` | **（本阶段新增）** mini-batch 训练循环、按样本数加权的批量评估、val_loss 选最佳 checkpoint（并列取更早 epoch）、npz checkpoint 保存/安全加载、运行目录与产物编排。 |
+| `src/training.py` | **（本阶段新增）** mini-batch 训练循环、按样本数加权的批量评估、val_loss 选最佳 checkpoint（并列取更早 epoch）、npz checkpoint 保存/安全加载、运行目录与产物编排；P5.3 扩展学习率调度（step）、早停、L2 正则化、测试集隔离与 run 角色。 |
+| `src/experiments.py` | **（P5.3 新增）** 跨 run 严格聚合器（strict 模式、schema 校验、组级统计汇总）。 |
 | `src/train_mnist.py` | **（本阶段新增）** 命令行入口：参数校验、显式下载、组装配置并调用训练编排。 |
 | `tests/` | 阶段 3 全部既有测试保留；新增 `test_mnist_data.py` 与 `test_training.py` 中的数据/切分/训练/产物/CLI 测试（全部离线）。 |
+
+## 最终报告与交付包
+
+P6 阶段课程报告（内容权威源为 Markdown，DOCX/PDF 为通用学术排版导出版，20 页，含目录与页码）：
+
+- 报告：[P6.2_final_report.md](docs/coursework-final-report/P6.2_final_report.md) ·
+  [P6.2_final_report.docx](docs/coursework-final-report/P6.2_final_report.docx) ·
+  [P6.2_final_report.pdf](docs/coursework-final-report/P6.2_final_report.pdf)
+- 同目录含全部图表（`figures/`，PNG 300dpi + SVG）、派生数据（`derived_data/`）、
+  图表溯源清单（`figure_manifest.md`）、绘图脚本（`plot_figures.py`）、环境记录
+  （`report_environment.txt`）与哈希清单（`SHA256SUMS.txt`）。
+- 说明：本地未找到教师模板/rubric，DOCX/PDF 为通用学术排版版本；报告不含作者/课程信息。
 
 ## 环境与安装
 
@@ -104,9 +118,9 @@ python -m src.train_mnist --epochs 5 --learning-rate 0.2 --run-name quick_check
 
 测试集（官方 10,000 样本）不参与训练、切分与超参数调整；只在训练全部 epoch 并按验证集
 `val_loss` 选出最佳 checkpoint **之后**评估一次。运行记录中 `best_validation_*` 与 `test_*`
-分开记录。本阶段不实现早停。
+分开记录。早停与学习率调度自 P5.3 起实现（CLI 可选启用，默认关闭）。
 
-## 已实际执行的实验与尚未执行的实验
+## 实验执行状态
 
 **已实际执行（真实 MNIST，非合成数据）**：
 
@@ -114,22 +128,15 @@ python -m src.train_mnist --epochs 5 --learning-rate 0.2 --run-name quick_check
   解析校验通过（60000/10000 张 28×28 图）。
 * 学习率冒烟：0.05 / 0.1 / 0.3 × 3 epoch（结果见上表）。
 * 正式基线：`python -m src.train_mnist`（30 epoch，lr 0.1，batch 128，seed 42/2026），
-  运行目录 `outputs/mnist_baseline/baseline_30ep_consistency_fix`，总耗时约 16 s：
+  运行目录 `outputs/mnist_baseline/baseline_30ep_consistency_fix`（测试 accuracy 0.9627）。
+* P5.3 预注册对照实验链 E0–E6 已全部完成并通过独立审计：E1 优化器/学习率（探索 9 run +
+  三种子确认 9 run）、E2 架构（15 run）、E3 激活函数与自动初始化组合（9 run）、
+  E4 L2 正则化（9 run）、E5 训练策略（12 run）、E6 冻结配置最终评估（3 run），共 66 个
+  P5.3 运行；E6 最终模型在官方 10,000 样本测试集上 test accuracy 97.35%（跨 3 seed
+  描述性统计，ddof=0）。实验结论、统计口径与全部局限详见最终报告。
 
-| 指标 | 数值 |
-| --- | --- |
-| 最佳 epoch | 29 |
-| 最佳验证 loss / accuracy | 0.1254 / 0.9576 |
-| 测试 loss / accuracy | 0.1210 / **0.9627** |
-
-* 一致性说明：测试集评估在恢复最佳 epoch 参数（`set_params(best_params)`）后进行，
-  summary 中的测试指标与 `best_model.npz` 保存的参数严格对应（独立重算逐位一致）。
-* 可复现性：多次独立完整运行的训练轨迹与验证指标完全一致
-  （best epoch 29、val_loss 0.1254）；整改前旧实现曾用最后 epoch 模型报告测试指标
-  （当时为 0.1260/0.9621），该不一致已由回归测试修复并锁定。
-
-**尚未执行（属后续阶段，不在本阶段授权内）**：多层网络/不同激活/不同优化器等扩展实验、
-Momentum/Adam、学习率调度、早停、正则化、ROC/AUC、最终课程报告。
+**后续工作**：仅作展望（在 [256] 架构上复核组件选择、解耦激活与初始化、完整 60k 训练集等），
+见最终报告第 13.4 节；本仓库不再自行追加实验。
 
 ## 运行测试
 

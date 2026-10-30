@@ -1,0 +1,2 @@
+# P6 交付包受 SHA256SUMS.txt 逐字节校验，禁止 Git 做行尾转换。
+docs/coursework-final-report/** -text

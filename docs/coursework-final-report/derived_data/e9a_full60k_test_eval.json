@@ -5,7 +5,7 @@
   "per_seed": [
     {
       "seed": 404,
-      "model_source": "E:\\2026\\10\\network\\mlp-coursework\\outputs\\p5.3\\E9_budget_data\\e9a_full60k\\e9a_full60k_seed404\\final_model.npz",
+      "model_source": "outputs/p5.3/E9_budget_data/e9a_full60k/e9a_full60k_seed404/final_model.npz",
       "params": "final_epoch（无验证集，无 best-epoch 选择）",
       "test_loss": 0.05221933734443014,
       "test_accuracy": 0.9839,
@@ -201,7 +201,7 @@
     },
     {
       "seed": 505,
-      "model_source": "E:\\2026\\10\\network\\mlp-coursework\\outputs\\p5.3\\E9_budget_data\\e9a_full60k\\e9a_full60k_seed505\\final_model.npz",
+      "model_source": "outputs/p5.3/E9_budget_data/e9a_full60k/e9a_full60k_seed505/final_model.npz",
       "params": "final_epoch（无验证集，无 best-epoch 选择）",
       "test_loss": 0.05702671639112775,
       "test_accuracy": 0.9817,
@@ -397,7 +397,7 @@
     },
     {
       "seed": 606,
-      "model_source": "E:\\2026\\10\\network\\mlp-coursework\\outputs\\p5.3\\E9_budget_data\\e9a_full60k\\e9a_full60k_seed606\\final_model.npz",
+      "model_source": "outputs/p5.3/E9_budget_data/e9a_full60k/e9a_full60k_seed606/final_model.npz",
       "params": "final_epoch（无验证集，无 best-epoch 选择）",
       "test_loss": 0.05550817781097312,
       "test_accuracy": 0.9813,

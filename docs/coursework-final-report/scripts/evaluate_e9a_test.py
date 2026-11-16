@@ -55,7 +55,8 @@ def main():
         per_class = per_class_metrics(matrix)
         macro = macro_average(per_class)
         results.append({
-            "seed": seed, "model_source": str(run_dir / "final_model.npz"),
+            "seed": seed,
+            "model_source": f"outputs/p5.3/E9_budget_data/e9a_full60k/e9a_full60k_seed{seed}/final_model.npz",
             "params": "final_epoch（无验证集，无 best-epoch 选择）",
             "test_loss": test_loss, "test_accuracy": test_accuracy,
             "confusion_matrix": matrix.tolist(),

@@ -176,7 +176,7 @@ def test_backward_and_cache_validation():
 
 
 def test_backward_cache_missing_required_keys_rejected_cleanly():
-    # 回归（审查 R2）：必需键校验必须用 issubset 判断；否则
+    # 回归：必需键校验必须用 issubset 判断；否则
     # {"A": ..., "unexpected": ...}（有 A 和杂键、缺 Z）会绕过校验并泄漏 KeyError。
     mlp = MLP(4, [5], 3, hidden_activation="tanh", seed=0)
     X = np.random.default_rng(10).normal(size=(3, 4))

@@ -383,7 +383,7 @@ def _run_cli(args):
 
 
 def test_summary_test_metrics_correspond_to_best_checkpoint(tmp_path, monkeypatch):
-    """复审整改回归：summary 的测试指标必须来自 best_model.npz 保存的最佳参数。
+    """回归：summary 的测试指标必须来自 best_model.npz 保存的最佳参数。
 
     场景刻意让最后一个 epoch 发散（val_loss 约 2.08，最佳 epoch 约 0.006），
     两组参数天差地别：旧实现用“最后 epoch 的 model”评估测试集，本测试在旧

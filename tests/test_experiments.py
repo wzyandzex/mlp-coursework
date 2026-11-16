@@ -357,7 +357,7 @@ def test_legacy_run_without_role_fields(tmp_path):
 
 
 # ---------------------------------------------------------------------------
-# P5.2-D-R1 整改：当前 schema 严格校验、legacy/null 区分与极端数值防护
+# schema 严格校验、legacy/null 区分与极端数值防护
 # ---------------------------------------------------------------------------
 
 
@@ -491,14 +491,14 @@ def test_sample_counts_mismatch_marked_invalid(tmp_path):
 
 
 # ---------------------------------------------------------------------------
-# P5.2-D-R2 整改：config.data.sample_counts 必需键校验
+# config.data.sample_counts 必需键校验
 # ---------------------------------------------------------------------------
 
 
 @pytest.mark.parametrize(
     "sample_counts, missing_inner_key",
     [
-        ("missing", None),                                 # 键整体缺失（R2 缺陷场景）
+        ("missing", None),                                 # 键整体缺失
         (None, None),                                      # 显式 null
         ({"train": 20000, "validation": 5000}, "test"),    # 缺 test
         ({"train": 20000, "test": 10000}, "validation"),   # 缺 validation

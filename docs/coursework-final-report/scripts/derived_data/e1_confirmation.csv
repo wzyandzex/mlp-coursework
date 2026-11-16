@@ -1,0 +1,4 @@
+config_label,n,mean_best_validation_loss,pstdev_best_validation_loss,mean_best_validation_accuracy,pstdev_best_validation_accuracy,run_names,source
+adam lr=0.003,3,0.1099526288771825,0.007131428826307715,0.9682666666666666,0.001359738536958064,E1_confirm_adam_lr0p003_seed101 E1_confirm_adam_lr0p003_seed202 E1_confirm_adam_lr0p003_seed303,outputs/p5.3/_aggregate_E1_confirmation/groups.json + per-run summary.json
+momentum_sgd lr=0.05,3,0.10148965641478312,0.0047614527913416495,0.9705333333333334,0.001968643074697798,E1_confirm_momentum_sgd_lr0p05_seed101 E1_confirm_momentum_sgd_lr0p05_seed202 E1_confirm_momentum_sgd_lr0p05_seed303,outputs/p5.3/_aggregate_E1_confirmation/groups.json + per-run summary.json
+sgd lr=0.2,3,0.10633939835665125,0.0021872207520107203,0.9676,0.0018832595855767193,E1_confirm_sgd_lr0p2_seed101 E1_confirm_sgd_lr0p2_seed202 E1_confirm_sgd_lr0p2_seed303,outputs/p5.3/_aggregate_E1_confirmation/groups.json + per-run summary.json

@@ -1,0 +1,219 @@
+{
+  "preregistration": "e9.md（P5.3-E9 预注册 V0.1）",
+  "deterministic_checks": {
+    "first30_epochs_bit_exact_vs_E6_seed404": true,
+    "first30_epochs_bit_exact_vs_E6_seed505": true,
+    "first30_epochs_bit_exact_vs_E6_seed606": true
+  },
+  "budget_study": {
+    "e6_30ep_frozen": {
+      "best_validation_loss": {
+        "mean": 0.08866636904998575,
+        "pstdev_ddof0": 0.0009713807806220455,
+        "values": [
+          0.08733433419992727,
+          0.08904146844512494,
+          0.08962330450490504
+        ]
+      },
+      "best_validation_accuracy": {
+        "mean": 0.9731333333333333,
+        "pstdev_ddof0": 0.0013199326582149003,
+        "values": [
+          0.975,
+          0.9722,
+          0.9722
+        ]
+      },
+      "best_epoch": {
+        "mean": 29.333333333333332,
+        "pstdev_ddof0": 0.4714045207910317,
+        "values": [
+          30,
+          29,
+          29
+        ]
+      }
+    },
+    "budget100_no_es": {
+      "best_validation_loss": {
+        "mean": 0.08320556577512585,
+        "pstdev_ddof0": 0.0004764760688337624,
+        "values": [
+          0.0830345458979032,
+          0.08385552971314987,
+          0.0827266217143245
+        ]
+      },
+      "best_validation_accuracy": {
+        "mean": 0.9752666666666667,
+        "pstdev_ddof0": 0.0006182412330330308,
+        "values": [
+          0.9758,
+          0.9744,
+          0.9756
+        ]
+      },
+      "best_epoch": {
+        "mean": 90.66666666666667,
+        "pstdev_ddof0": 2.357022603955158,
+        "values": [
+          94.0,
+          89.0,
+          89.0
+        ]
+      }
+    },
+    "budget100_es": {
+      "best_validation_loss": {
+        "mean": 0.08913921565623084,
+        "pstdev_ddof0": 0.0003620112298482127,
+        "values": [
+          0.08875287401866254,
+          0.08904146844512494,
+          0.08962330450490504
+        ]
+      },
+      "best_validation_accuracy": {
+        "mean": 0.9723999999999999,
+        "pstdev_ddof0": 0.0002828427124746402,
+        "values": [
+          0.9728,
+          0.9722,
+          0.9722
+        ]
+      },
+      "best_epoch": {
+        "mean": 26.333333333333332,
+        "pstdev_ddof0": 3.7712361663282534,
+        "values": [
+          21.0,
+          29.0,
+          29.0
+        ]
+      }
+    },
+    "per_run": {
+      "no_es_seed404": {
+        "best_validation_loss": 0.0830345458979032,
+        "best_validation_accuracy": 0.9758,
+        "best_epoch": 94,
+        "stop_reason": "max_epochs",
+        "epochs_completed": 100,
+        "total_seconds": 159.09240550000686
+      },
+      "es_seed404": {
+        "best_validation_loss": 0.08875287401866254,
+        "best_validation_accuracy": 0.9728,
+        "best_epoch": 21,
+        "stop_reason": "early_stopping",
+        "epochs_completed": 25,
+        "total_seconds": 31.255363500036765
+      },
+      "no_es_seed505": {
+        "best_validation_loss": 0.08385552971314987,
+        "best_validation_accuracy": 0.9744,
+        "best_epoch": 89,
+        "stop_reason": "max_epochs",
+        "epochs_completed": 100,
+        "total_seconds": 129.1630971999839
+      },
+      "es_seed505": {
+        "best_validation_loss": 0.08904146844512494,
+        "best_validation_accuracy": 0.9722,
+        "best_epoch": 29,
+        "stop_reason": "early_stopping",
+        "epochs_completed": 34,
+        "total_seconds": 48.03324860002613
+      },
+      "no_es_seed606": {
+        "best_validation_loss": 0.0827266217143245,
+        "best_validation_accuracy": 0.9756,
+        "best_epoch": 89,
+        "stop_reason": "max_epochs",
+        "epochs_completed": 100,
+        "total_seconds": 131.79754050000338
+      },
+      "es_seed606": {
+        "best_validation_loss": 0.08962330450490504,
+        "best_validation_accuracy": 0.9722,
+        "best_epoch": 29,
+        "stop_reason": "early_stopping",
+        "epochs_completed": 34,
+        "total_seconds": 43.151944099983666
+      }
+    }
+  },
+  "full60k_study": {
+    "per_run": {
+      "seed404": {
+        "final_train_loss": 0.008175240931933024,
+        "final_train_objective_loss": 0.038875833157957104,
+        "final_train_accuracy": 0.9997166666666667,
+        "epochs_completed": 30,
+        "sample_counts": {
+          "train": 60000,
+          "validation": 0,
+          "test": 10000
+        }
+      },
+      "seed505": {
+        "final_train_loss": 0.008063259919111977,
+        "final_train_objective_loss": 0.03887993777988372,
+        "final_train_accuracy": 0.9998333333333334,
+        "epochs_completed": 30,
+        "sample_counts": {
+          "train": 60000,
+          "validation": 0,
+          "test": 10000
+        }
+      },
+      "seed606": {
+        "final_train_loss": 0.008100179765512387,
+        "final_train_objective_loss": 0.03880891229902077,
+        "final_train_accuracy": 0.99965,
+        "epochs_completed": 30,
+        "sample_counts": {
+          "train": 60000,
+          "validation": 0,
+          "test": 10000
+        }
+      }
+    },
+    "test_eval_reference": {
+      "preregistration_statement": "第三次测试集前向于 e9.md §5 预先声明（2026-11-08；前向簿记：E6 原始评估、2026-10-30 ROC/AUC 补充评估、本次）",
+      "group_stats": {
+        "test_loss": {
+          "mean": 0.054918077182177005,
+          "pstdev_ddof0": 0.002006470763760088
+        },
+        "test_accuracy": {
+          "mean": 0.9823,
+          "pstdev_ddof0": 0.0011430952132988265
+        }
+      },
+      "per_seed": [
+        {
+          "seed": 404,
+          "test_loss": 0.05221933734443014,
+          "test_accuracy": 0.9839,
+          "macro_f1": 0.9838516299290644
+        },
+        {
+          "seed": 505,
+          "test_loss": 0.05702671639112775,
+          "test_accuracy": 0.9817,
+          "macro_f1": 0.9816174887489335
+        },
+        {
+          "seed": 606,
+          "test_loss": 0.05550817781097312,
+          "test_accuracy": 0.9813,
+          "macro_f1": 0.981194322763766
+        }
+      ],
+      "protocol_differences": "60k 无验证集：无早停、无 best-epoch 选择，评估对象为 30 epoch 固定预算的最终 epoch 参数（E1–E6 为验证集选最佳 epoch）"
+    }
+  },
+  "note": "3 seed 描述性统计（ddof=0）；E9 无预注册推断检验，不使用'显著'措辞；60k 模型不替换 E6 交付模型（e9.md §4）"
+}

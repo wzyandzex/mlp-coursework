@@ -1,0 +1,68 @@
+{
+  "method": "second approved forward pass over the sealed test set (author approval 2026-10-30); no retraining; frozen best_model.npz; reproduction of sealed summary asserted",
+  "seeds": {
+    "404": {
+      "accuracy_recomputed": 0.9736,
+      "loss_recomputed": 0.08690538904329995,
+      "confusion_matrix_match": true,
+      "accuracy_match": true,
+      "loss_match": true,
+      "per_class_match": true,
+      "per_class_auc_ovr": {
+        "0": 0.9998602877958279,
+        "1": 0.9998555920799262,
+        "2": 0.9990838441936533,
+        "3": 0.9995221313010055,
+        "4": 0.9997246963416457,
+        "5": 0.9995355928164468,
+        "6": 0.9995708960134543,
+        "7": 0.9993011114561342,
+        "8": 0.999302380392305,
+        "9": 0.9990855297539584
+      },
+      "macro_auc_ovr": 0.9994842062144358
+    },
+    "505": {
+      "accuracy_recomputed": 0.9733,
+      "loss_recomputed": 0.09012951987452647,
+      "confusion_matrix_match": true,
+      "accuracy_match": true,
+      "loss_match": true,
+      "per_class_match": true,
+      "per_class_auc_ovr": {
+        "0": 0.9998734105615639,
+        "1": 0.9997641569206228,
+        "2": 0.9992660164650886,
+        "3": 0.9993414024383529,
+        "4": 0.9996374076919706,
+        "5": 0.9994184140094649,
+        "6": 0.9995173301674071,
+        "7": 0.9992132895944321,
+        "8": 0.9992118365788817,
+        "9": 0.9988637464686358
+      },
+      "macro_auc_ovr": 0.9994107010896421
+    },
+    "606": {
+      "accuracy_recomputed": 0.9735,
+      "loss_recomputed": 0.08566455854392743,
+      "confusion_matrix_match": true,
+      "accuracy_match": true,
+      "loss_match": true,
+      "per_class_match": true,
+      "per_class_auc_ovr": {
+        "0": 0.999871374270329,
+        "1": 0.9998296523227761,
+        "2": 0.9993005924596671,
+        "3": 0.9995059416953931,
+        "4": 0.9996196789494105,
+        "5": 0.9994320766644806,
+        "6": 0.999531529734355,
+        "7": 0.999346323451603,
+        "8": 0.9992819056606264,
+        "9": 0.9991393221213726
+      },
+      "macro_auc_ovr": 0.9994858397330013
+    }
+  }
+}

@@ -3,8 +3,8 @@
 ## 当前阶段与模块职责
 
 在阶段 3 的手写 NumPy 核心（P3-CORE-01 已关闭）与阶段 4 的 MNIST 训练闭环之上，P5.3 按
-预注册流程完成了对照实验链 E0–E6，并延伸补充验证实验 E7/E8/E9；P6 生成最终课程报告与
-图表（交付包见 `docs/coursework-final-report/`，报告 V0.5，46 页）。
+预注册流程分两轮完成了实验：第一轮对照实验链 E0–E6，第二轮系统验证 E7–E9；P6 生成最终课程报告与
+图表（交付包见 `docs/coursework-final-report/`，报告 V0.5，47 页）。
 
 | 模块 | 职责 |
 | --- | --- |
@@ -20,7 +20,7 @@
 
 ## 最终报告与交付包
 
-P6 阶段课程报告（报告 V0.5，DOCX/PDF 46 页，含目录与页码；内容权威源为 Markdown）：
+P6 阶段课程报告（报告 V0.5，DOCX/PDF 47 页，含目录与页码；内容权威源为 Markdown）：
 
 - 报告：[P6.2_final_report.md](docs/coursework-final-report/P6.2_final_report.md) ·
   [P6.2_final_report.docx](docs/coursework-final-report/P6.2_final_report.docx) ·
@@ -140,12 +140,12 @@ python -m src.train_mnist --epochs 5 --learning-rate 0.2 --run-name quick_check
   E4 L2 正则化（9 run）、E5 训练策略（12 run）、E6 冻结配置最终评估（3 run），共 66 个
   P5.3 运行；E6 最终模型在官方 10,000 样本测试集上 test accuracy 97.35%（跨 3 seed
   描述性统计，ddof=0）。
-* 补充验证实验 E7/E8/E9 已按预注册完成（先冻结后训练，预注册见
+* 第二轮实验 E7–E9 已按预注册完成（先冻结后训练，预注册见
   `docs/coursework-final-report/preregistrations/`）：E7 把组件对照搬到最终架构 [256]
   并解耦激活×初始化（39 run，排序全部复现）；E8 对四个实际选型决定各以 10 个模型种子
   做精确置换检验（35 新 run，Holm 校正：架构与 L2 选择显著，优化器与激活同向未达阈值）；
   E9 量化 100 epoch 预算收益与完整 60,000 训练样本（9 run；60k 全量测试 98.23%，为预先
-  声明的补充研究，交付模型仍为 E6 的 97.35%）。
+  声明的数据规模研究，交付模型仍为 E6 的 97.35%）。
 * 实验结论、统计口径、全部局限与上述补充验证详见最终报告 §13–§14。
 
 ## 运行测试

@@ -447,7 +447,7 @@ def bar_fig(stem, title, ylabel, items, colors, note=ERROR_BAR_NOTE,
 
 
 # ---- fig01: experiment flow (vertical, portrait-friendly) ----------------
-fig, ax = plt.subplots(figsize=(7.2, 5.8), constrained_layout=True)
+fig, ax = plt.subplots(figsize=(7.2, 7.6), constrained_layout=True)
 ax.set_xlim(0, 100); ax.set_ylim(0, 100); ax.axis("off"); ax.grid(False)
 stages = [
     ("E0 historical baseline",
@@ -466,12 +466,24 @@ stages = [
      "2x2 schedule x early-stop x 3 seeds; 12 runs\nfixed, no early stopping wins", "green"),
     ("E6 final evaluation",
      "frozen config; 3 seeds (404/505/606)\ntest set used once", "vermillion"),
+    ("__divider__",
+     "Round 2: systematic validation of the round-1 selections (83 runs; 80 validation-only)", None),
+    ("E7 validation on [256]",
+     "E3/E4/E5 protocols re-run on [256]; activation x init factorial\n39 runs; all rankings reproduced", "green"),
+    ("E8 permutation tests",
+     "4 selection decisions x 10 seeds; exact permutation + Holm\n35 runs; architecture & L2 significant", "green"),
+    ("E9 budget & data scale",
+     "100-epoch budget; full 60k training set (declared 3rd test forward)\n9 runs; 60k test accuracy 98.23%", "vermillion"),
 ]
-top, bottom = 93, 10
+top, bottom = 93, 9
 row_h = (top - bottom) / len(stages)
 for i, (name, detail, color) in enumerate(stages):
     y = top - (i + 1) * row_h + 0.5
     h = row_h - 1.6
+    if name == "__divider__":
+        ax.text(50, y + h / 2, detail, ha="center", va="center",
+                fontsize=8.6, fontweight="bold", style="italic")
+        continue
     fc = "lightgray" if color == "gray" else OKABE[color]
     box = FancyBboxPatch((2, y), 96, h,
                          boxstyle="round,pad=0.25,rounding_size=0.8",
@@ -482,14 +494,15 @@ for i, (name, detail, color) in enumerate(stages):
     ax.text(4.5, y + h / 2, name, ha="left", va="center",
             fontsize=8.4, fontweight="bold")
     ax.text(38, y + h / 2, detail, ha="left", va="center", fontsize=8.0)
-    if i < len(stages) - 1:
+    if i < len(stages) - 1 and stages[i + 1][0] != "__divider__":
         ax.annotate("", xy=(50, y - 1.5), xytext=(50, y - 0.1),
                     arrowprops=dict(arrowstyle="-|>", lw=0.9, color="black"))
-ax.text(50, 98.5, "E0 -> E6 preregistered sequence (validation drives E1-E5; test set used only by E6)",
-        ha="center", va="top", fontsize=9.6, fontweight="bold")
-ax.text(50, 3.0, "All P5.3 stages share split_seed 2026 and 20000/5000/10000 samples;\n"
-                 "the A0 pilot is one of the 9 E1 exploration runs (counted once).",
-        ha="center", va="center", fontsize=8.2)
+ax.text(50, 98.5, "Two-round preregistered program (149 runs):\n"
+                  "Round 1 E0-E6 selection & final evaluation (66); Round 2 E7-E9 systematic validation (83)",
+        ha="center", va="top", fontsize=9.2, fontweight="bold")
+ax.text(50, 3.2, "All stages share split_seed 2026 and 20000/5000/10000 samples (E9-A uses the full 60k train set);\n"
+                 "the A0 pilot is one of the 9 E1 exploration runs (counted once). Test set used only by E6 and two declared evaluations.",
+        ha="center", va="center", fontsize=7.8)
 save_fig(fig, "fig01_experiment_flow")
 
 # ---- fig02: E1 confirmation ----------------------------------------------
